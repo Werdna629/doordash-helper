@@ -80,6 +80,33 @@ class BrowserManager {
     return loggedIn;
   }
 
+  /**
+   * Import cookies from a raw cookie string (copied from browser DevTools).
+   * This bypasses the browser login flow entirely — just injects session cookies
+   * into the headless browser profile.
+   */
+  async importCookies(rawCookies: string): Promise<boolean> {
+    const context = await this.getContext();
+
+    // Parse the cookie string — supports both:
+    // 1. "key=value; key2=value2" format (from document.cookie or DevTools "Copy as cURL")
+    // 2. JSON array format (from EditThisCookie or similar extensions)
+    const cookies = this.parseCookies(rawCookies);
+
+    if (cookies.length === 0) return false;
+
+    await context.addCookies(cookies);
+
+    // Navigate to DoorDash to ensure cookies are applied
+    const page = await this.getPage();
+    await page.goto("https://www.doordash.com/home/", {
+      waitUntil: "domcontentloaded",
+      timeout: 15_000,
+    });
+
+    return true;
+  }
+
   /** Check if the current session is authenticated. */
   async checkAuth(): Promise<{ loggedIn: boolean; userName: string | null }> {
     const page = await this.getPage();
@@ -155,6 +182,64 @@ class BrowserManager {
   }
 
   // -- Private helpers --
+
+  private parseCookies(
+    raw: string
+  ): Array<{
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+  }> {
+    const trimmed = raw.trim();
+
+    // Try JSON array format first (e.g., from EditThisCookie extension)
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed) as Array<{
+          name: string;
+          value: string;
+          domain?: string;
+          path?: string;
+        }>;
+        return parsed.map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain || ".doordash.com",
+          path: c.path || "/",
+        }));
+      } catch {
+        // fall through to string parsing
+      }
+    }
+
+    // Parse "key=value; key2=value2" format
+    const cookies: Array<{
+      name: string;
+      value: string;
+      domain: string;
+      path: string;
+    }> = [];
+
+    for (const part of trimmed.split(";")) {
+      const eqIndex = part.indexOf("=");
+      if (eqIndex === -1) continue;
+
+      const name = part.slice(0, eqIndex).trim();
+      const value = part.slice(eqIndex + 1).trim();
+
+      if (!name) continue;
+
+      cookies.push({
+        name,
+        value,
+        domain: ".doordash.com",
+        path: "/",
+      });
+    }
+
+    return cookies;
+  }
 
   private async waitForLogin(
     page: Page,
