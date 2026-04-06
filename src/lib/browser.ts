@@ -158,10 +158,8 @@ class BrowserManager {
         }
       }
 
-      const statusCode = response?.status() ?? 0;
-
       return {
-        loggedIn: !isOnLoginPage && statusCode < 400,
+        loggedIn: !isOnLoginPage,
         userName,
         cookieInfo: `${cookies.length} cookies (${cookieNames.slice(0, 8).join(", ")}${cookies.length > 8 ? "..." : ""}). Final URL: ${finalUrl}`,
       };
