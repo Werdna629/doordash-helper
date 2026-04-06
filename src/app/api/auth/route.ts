@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { browserManager } from "@/lib/browser";
+import { sessionManager } from "@/lib/session";
 
 /** GET /api/auth — Check if the DoorDash session is authenticated */
 export async function GET() {
   try {
-    const status = await browserManager.checkAuth();
+    const status = await sessionManager.checkAuth();
     return NextResponse.json(status);
   } catch (error) {
     return NextResponse.json(
@@ -17,40 +17,40 @@ export async function GET() {
 /**
  * POST /api/auth — Authenticate with DoorDash.
  *
- * Two modes:
- * - No body or empty body: trigger browser login flow (opens visible window)
- * - Body with { cookies: "..." }: import cookies directly (paste from DevTools)
+ * Body: { cookies: "curl command or cookie string" }
+ * Extracts cookies and headers from the pasted cURL, stores them,
+ * and verifies the session works.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json().catch(() => ({}));
     const { cookies } = body as { cookies?: string };
 
-    if (cookies && cookies.trim()) {
-      // Cookie-paste auth
-      const result = await browserManager.importCookies(cookies);
-      if (!result.success) {
-        return NextResponse.json(
-          { success: false, error: result.error },
-          { status: 400 }
-        );
-      }
-
-      // Verify the cookies actually work
-      const status = await browserManager.checkAuth();
-      return NextResponse.json({
-        success: status.loggedIn,
-        cookieCount: result.cookieCount,
-        cookieInfo: status.cookieInfo,
-        error: status.loggedIn
-          ? null
-          : `Imported ${result.cookieCount} cookies but session not recognized. ${status.cookieInfo || ""}. Cookies may be expired — try copying fresh ones.`,
-      });
+    if (!cookies || !cookies.trim()) {
+      return NextResponse.json(
+        { success: false, error: "Paste a cURL command or cookie string" },
+        { status: 400 }
+      );
     }
 
-    // Browser login flow
-    const success = await browserManager.login();
-    return NextResponse.json({ success });
+    const result = sessionManager.importFromCurl(cookies);
+    if (!result.success) {
+      return NextResponse.json(
+        { success: false, error: result.error },
+        { status: 400 }
+      );
+    }
+
+    // Verify the cookies actually work
+    const status = await sessionManager.checkAuth();
+    return NextResponse.json({
+      success: status.loggedIn,
+      cookieCount: result.cookieCount,
+      cookieInfo: status.cookieInfo,
+      error: status.loggedIn
+        ? null
+        : `Imported ${result.cookieCount} cookies but session not recognized. ${status.cookieInfo || ""}`,
+    });
   } catch (error) {
     return NextResponse.json(
       { success: false, error: String(error) },

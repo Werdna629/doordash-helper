@@ -1,17 +1,14 @@
-import { browserManager } from "./browser";
+import { sessionManager } from "./session";
 import type { SearchResult, Store } from "./types";
 
 /**
  * DoorDash API client.
  *
- * DoorDash uses Next.js with React Server Components (RSC). Page navigations
- * are blocked by Cloudflare bot detection, but in-browser fetch() requests
- * with RSC headers bypass this and return parseable text/x-component payloads.
- *
- * We run fetch() inside the Patchright browser context so that:
- * - Cookies are automatically included (same origin)
- * - TLS fingerprint matches a real browser
- * - Cloudflare doesn't intercept XHR/fetch the same way as navigations
+ * DoorDash uses Next.js with React Server Components (RSC). Cloudflare blocks
+ * all headless browser page navigations. Instead, we make direct HTTP requests
+ * from Node.js using the user's real browser cookies (including cf_clearance)
+ * extracted from a pasted cURL command. We request RSC payloads with the
+ * appropriate headers and parse the text/x-component response format.
  */
 
 // RSC headers that DoorDash's Next.js expects
@@ -51,7 +48,7 @@ export async function getStoreInfo(
 ): Promise<{ store: Store | null; debug: string }> {
   try {
     const rscUrl = storeUrl.endsWith("/") ? storeUrl : storeUrl + "/";
-    const result = await browserManager.browserFetchText(rscUrl, {
+    const result = await sessionManager.fetchText(rscUrl, {
       ...RSC_HEADERS,
       "Next-Url": `/convenience/store/${storeId}`,
     });
@@ -100,7 +97,7 @@ export async function searchItems(
 ): Promise<{ results: SearchResult[]; debug: string }> {
   try {
     const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/${encodeURIComponent(query)}/`;
-    const result = await browserManager.browserFetchText(searchUrl, {
+    const result = await sessionManager.fetchText(searchUrl, {
       ...RSC_HEADERS,
       "Next-Url": `/convenience/store/${storeId}/search/${encodeURIComponent(query)}`,
     });
@@ -347,70 +344,6 @@ function extractSearchResults(parsed: unknown[], rawText: string, storeId: strin
   }
 
   return results;
-}
-
-// ============================================================
-// Network Request Capture (for debugging)
-// ============================================================
-
-/**
- * Navigate to a page and capture all network requests/responses.
- * Useful for debugging what DoorDash's page is doing.
- */
-export async function captureNetworkRequests(
-  storeUrl: string,
-  durationMs: number = 10_000
-): Promise<
-  Array<{
-    url: string;
-    method: string;
-    contentType: string;
-    responsePreview: string;
-  }>
-> {
-  const page = await browserManager.getPage();
-  const captured: Array<{
-    url: string;
-    method: string;
-    contentType: string;
-    responsePreview: string;
-  }> = [];
-
-  const responseHandler = async (response: {
-    url: () => string;
-    request: () => { method: () => string };
-    headers: () => Record<string, string>;
-    text: () => Promise<string>;
-  }) => {
-    const url = response.url();
-    if (
-      url.includes("graphql") ||
-      url.includes("/search") ||
-      url.includes("/store/") ||
-      url.includes("api")
-    ) {
-      try {
-        const text = await response.text();
-        captured.push({
-          url,
-          method: response.request().method(),
-          contentType: response.headers()["content-type"] || "unknown",
-          responsePreview: text.slice(0, 500),
-        });
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-
-  page.on("response", responseHandler);
-
-  await page.goto(storeUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
-  await page.waitForTimeout(durationMs);
-
-  page.off("response", responseHandler);
-
-  return captured;
 }
 
 // ============================================================

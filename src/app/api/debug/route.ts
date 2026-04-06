@@ -1,34 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
-import { captureNetworkRequests } from "@/lib/doordash-api";
+import { sessionManager } from "@/lib/session";
 
 /**
- * POST /api/debug — Capture network requests from a DoorDash page.
- * Useful for debugging what requests/responses DoorDash makes.
- * Body: { storeUrl: string, durationMs?: number }
+ * POST /api/debug — Test a direct fetch to a DoorDash URL.
+ * Body: { url: string }
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { storeUrl, durationMs } = body as {
-      storeUrl?: string;
-      durationMs?: number;
-    };
+    const { url } = body as { url?: string };
 
-    if (!storeUrl) {
+    if (!url) {
       return NextResponse.json(
-        { error: "Missing 'storeUrl' in request body" },
+        { error: "Missing 'url' in request body" },
         { status: 400 }
       );
     }
 
-    const requests = await captureNetworkRequests(
-      storeUrl,
-      durationMs ?? 10_000
-    );
+    const result = await sessionManager.fetchText(url);
 
     return NextResponse.json({
-      captured: requests.length,
-      requests,
+      status: result.status,
+      contentType: result.contentType,
+      length: result.text.length,
+      preview: result.text.slice(0, 2000),
     });
   } catch (error) {
     return NextResponse.json(
