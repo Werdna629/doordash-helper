@@ -28,10 +28,10 @@ export async function POST(request: NextRequest) {
 
     if (cookies && cookies.trim()) {
       // Cookie-paste auth
-      const success = await browserManager.importCookies(cookies);
-      if (!success) {
+      const result = await browserManager.importCookies(cookies);
+      if (!result.success) {
         return NextResponse.json(
-          { success: false, error: "Could not parse cookies. See instructions on the page." },
+          { success: false, error: result.error },
           { status: 400 }
         );
       }
@@ -40,7 +40,11 @@ export async function POST(request: NextRequest) {
       const status = await browserManager.checkAuth();
       return NextResponse.json({
         success: status.loggedIn,
-        error: status.loggedIn ? null : "Cookies were imported but the session appears invalid. They may be expired.",
+        cookieCount: result.cookieCount,
+        cookieInfo: status.cookieInfo,
+        error: status.loggedIn
+          ? null
+          : `Imported ${result.cookieCount} cookies but session not recognized. ${status.cookieInfo || ""}. Cookies may be expired — try copying fresh ones.`,
       });
     }
 

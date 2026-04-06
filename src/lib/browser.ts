@@ -84,35 +84,59 @@ class BrowserManager {
    * Import cookies from a raw cookie string (copied from browser DevTools).
    * This bypasses the browser login flow entirely — just injects session cookies
    * into the headless browser profile.
+   *
+   * Supported formats:
+   * - "key=value; key2=value2" (from document.cookie in console)
+   * - Full cURL command (extracts the -H 'cookie: ...' or -b '...' header)
+   * - JSON array (from cookie export extensions like EditThisCookie)
    */
-  async importCookies(rawCookies: string): Promise<boolean> {
+  async importCookies(rawCookies: string): Promise<{ success: boolean; cookieCount: number; error?: string }> {
     const context = await this.getContext();
 
-    // Parse the cookie string — supports both:
-    // 1. "key=value; key2=value2" format (from document.cookie or DevTools "Copy as cURL")
-    // 2. JSON array format (from EditThisCookie or similar extensions)
     const cookies = this.parseCookies(rawCookies);
 
-    if (cookies.length === 0) return false;
+    if (cookies.length === 0) {
+      return { success: false, cookieCount: 0, error: "No cookies could be parsed from the input." };
+    }
 
     await context.addCookies(cookies);
 
-    // Navigate to DoorDash to ensure cookies are applied
+    // Navigate to DoorDash to ensure cookies take effect
     const page = await this.getPage();
     await page.goto("https://www.doordash.com/home/", {
       waitUntil: "domcontentloaded",
       timeout: 15_000,
     });
 
-    return true;
+    return { success: true, cookieCount: cookies.length };
   }
 
-  /** Check if the current session is authenticated. */
-  async checkAuth(): Promise<{ loggedIn: boolean; userName: string | null }> {
-    const page = await this.getPage();
-
+  /**
+   * Check if the current session is authenticated.
+   * Uses the Playwright context cookie API (not document.cookie) so we can
+   * see HttpOnly cookies like session tokens.
+   */
+  async checkAuth(): Promise<{ loggedIn: boolean; userName: string | null; cookieInfo?: string }> {
     try {
-      // Navigate to DoorDash home and check for auth indicators
+      const context = await this.getContext();
+
+      // Check cookies via Playwright API — this sees HttpOnly cookies too
+      const cookies = await context.cookies("https://www.doordash.com");
+      const sessionCookieNames = ["ddsid", "credential_token", "dd_session"];
+      const foundSession = cookies.filter((c) =>
+        sessionCookieNames.includes(c.name)
+      );
+
+      if (foundSession.length > 0) {
+        return {
+          loggedIn: true,
+          userName: null,
+          cookieInfo: `Found session cookies: ${foundSession.map((c) => c.name).join(", ")}`,
+        };
+      }
+
+      // Fallback: navigate and check if DoorDash redirects us or shows logged-in UI
+      const page = await this.getPage();
       const response = await page.goto("https://www.doordash.com/home/", {
         waitUntil: "domcontentloaded",
         timeout: 15_000,
@@ -122,17 +146,33 @@ class BrowserManager {
         return { loggedIn: false, userName: null };
       }
 
-      // Check for login-gated elements — if we see the account icon or user name, we're logged in
-      const isLoggedIn = await page.evaluate(() => {
-        // DoorDash shows different UI for logged-in vs logged-out users
-        // Check cookies for session indicators
-        return document.cookie.includes("ddsid") ||
-               document.cookie.includes("credential_token");
-      });
+      // Re-check cookies after navigation (DoorDash may set them on page load)
+      const postNavCookies = await context.cookies("https://www.doordash.com");
+      const postNavSession = postNavCookies.filter((c) =>
+        sessionCookieNames.includes(c.name)
+      );
 
-      return { loggedIn: isLoggedIn, userName: null };
-    } catch {
-      return { loggedIn: false, userName: null };
+      if (postNavSession.length > 0) {
+        return {
+          loggedIn: true,
+          userName: null,
+          cookieInfo: `Found session cookies after navigation: ${postNavSession.map((c) => c.name).join(", ")}`,
+        };
+      }
+
+      // Check if the page URL indicates we're logged in (not redirected to login)
+      const currentUrl = page.url();
+      const isOnLoginPage =
+        currentUrl.includes("/consumer/login") ||
+        currentUrl.includes("/identity/login");
+
+      return {
+        loggedIn: !isOnLoginPage,
+        userName: null,
+        cookieInfo: `${postNavCookies.length} total cookies, no known session cookies found. URL: ${currentUrl}`,
+      };
+    } catch (err) {
+      return { loggedIn: false, userName: null, cookieInfo: `Error: ${err}` };
     }
   }
 
@@ -191,7 +231,7 @@ class BrowserManager {
     domain: string;
     path: string;
   }> {
-    const trimmed = raw.trim();
+    let trimmed = raw.trim();
 
     // Try JSON array format first (e.g., from EditThisCookie extension)
     if (trimmed.startsWith("[")) {
@@ -213,7 +253,49 @@ class BrowserManager {
       }
     }
 
+    // If it looks like a cURL command, extract the cookie header
+    if (trimmed.startsWith("curl ") || trimmed.includes("curl '")) {
+      trimmed = this.extractCookiesFromCurl(trimmed);
+    }
+
     // Parse "key=value; key2=value2" format
+    return this.parseCookieString(trimmed);
+  }
+
+  /** Extract cookie string from a cURL command */
+  private extractCookiesFromCurl(curl: string): string {
+    // Match -H 'cookie: ...' or -H "cookie: ..." (case-insensitive)
+    const headerMatch = curl.match(
+      /-H\s+['"]cookie:\s*([^'"]+)['"]/i
+    );
+    if (headerMatch) return headerMatch[1];
+
+    // Match -b '...' or -b "..." or --cookie '...'
+    const bMatch = curl.match(
+      /(?:-b|--cookie)\s+['"]([^'"]+)['"]/
+    );
+    if (bMatch) return bMatch[1];
+
+    // Match -H 'Cookie: ...' with different casing / whitespace
+    const headerMatch2 = curl.match(
+      /-H\s+['"][Cc]ookie:\s*([^'"]+)['"]/
+    );
+    if (headerMatch2) return headerMatch2[1];
+
+    // Couldn't find cookies in the cURL command — return as-is and hope
+    // it's just a cookie string that happens to have "curl" in it
+    return curl;
+  }
+
+  /** Parse a "key=value; key2=value2" cookie string */
+  private parseCookieString(
+    cookieStr: string
+  ): Array<{
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+  }> {
     const cookies: Array<{
       name: string;
       value: string;
@@ -221,7 +303,7 @@ class BrowserManager {
       path: string;
     }> = [];
 
-    for (const part of trimmed.split(";")) {
+    for (const part of cookieStr.split(";")) {
       const eqIndex = part.indexOf("=");
       if (eqIndex === -1) continue;
 

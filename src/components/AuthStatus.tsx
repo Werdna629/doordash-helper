@@ -9,6 +9,7 @@ export default function AuthStatus() {
   const [showCookieInput, setShowCookieInput] = useState(false);
   const [cookieText, setCookieText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<string | null>(null);
 
   const checkAuth = async () => {
     setChecking(true);
@@ -17,6 +18,7 @@ export default function AuthStatus() {
       const res = await fetch("/api/auth");
       const data = await res.json();
       setLoggedIn(data.loggedIn);
+      setDebugInfo(data.cookieInfo || null);
     } catch {
       setLoggedIn(false);
     } finally {
@@ -54,6 +56,7 @@ export default function AuthStatus() {
     if (!cookieText.trim()) return;
     setLoading(true);
     setError(null);
+    setDebugInfo(null);
     try {
       const res = await fetch("/api/auth", {
         method: "POST",
@@ -61,6 +64,11 @@ export default function AuthStatus() {
         body: JSON.stringify({ cookies: cookieText.trim() }),
       });
       const data = await res.json();
+      setDebugInfo(
+        data.cookieInfo
+          ? `${data.cookieCount ?? "?"} cookies imported. ${data.cookieInfo}`
+          : null
+      );
       if (data.success) {
         setLoggedIn(true);
         setShowCookieInput(false);
@@ -82,15 +90,20 @@ export default function AuthStatus() {
       {checking ? (
         <p className="text-gray-500">Checking login status...</p>
       ) : loggedIn ? (
-        <div className="flex items-center gap-2">
-          <span className="inline-block h-3 w-3 rounded-full bg-green-500" />
-          <span className="text-green-700">Logged in</span>
-          <button
-            onClick={checkAuth}
-            className="ml-auto text-sm text-gray-500 underline hover:text-gray-700"
-          >
-            Refresh
-          </button>
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span className="inline-block h-3 w-3 rounded-full bg-green-500" />
+            <span className="text-green-700">Logged in</span>
+            <button
+              onClick={checkAuth}
+              className="ml-auto text-sm text-gray-500 underline hover:text-gray-700"
+            >
+              Refresh
+            </button>
+          </div>
+          {debugInfo && (
+            <p className="text-xs text-gray-400">{debugInfo}</p>
+          )}
         </div>
       ) : (
         <div className="space-y-3">
@@ -153,6 +166,7 @@ export default function AuthStatus() {
                     setShowCookieInput(false);
                     setCookieText("");
                     setError(null);
+                    setDebugInfo(null);
                   }}
                   className="rounded border border-gray-300 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
                 >
@@ -167,55 +181,62 @@ export default function AuthStatus() {
             <summary className="cursor-pointer font-medium text-gray-700">
               How to get your DoorDash cookies
             </summary>
-            <ol className="mt-2 list-inside list-decimal space-y-1.5">
+            <ol className="mt-2 list-inside list-decimal space-y-2">
               <li>
                 Open{" "}
-                <span className="font-mono text-blue-700">
-                  doordash.com
-                </span>{" "}
-                in Chrome/Firefox and <strong>log in normally</strong>.
+                <strong>doordash.com</strong>{" "}
+                in Chrome and <strong>log in normally</strong>.
               </li>
               <li>
-                Open DevTools (<kbd className="rounded border bg-gray-200 px-1">F12</kbd> or{" "}
-                <kbd className="rounded border bg-gray-200 px-1">Cmd+Opt+I</kbd>).
+                Open DevTools with{" "}
+                <kbd className="rounded border border-gray-300 bg-gray-200 px-1">F12</kbd>.
               </li>
               <li>
-                Go to the <strong>Application</strong> tab (Chrome) or{" "}
-                <strong>Storage</strong> tab (Firefox).
+                Go to the <strong>Network</strong> tab.
               </li>
               <li>
-                In the left sidebar, expand <strong>Cookies</strong> and click{" "}
-                <strong>https://www.doordash.com</strong>.
+                Refresh the page, then click on <strong>any request</strong> to{" "}
+                <code className="rounded bg-gray-200 px-1">doordash.com</code>{" "}
+                in the list.
               </li>
               <li>
-                You need to copy all cookies. The easiest ways:
-                <ul className="ml-4 mt-1 list-disc space-y-1">
-                  <li>
-                    <strong>Console method:</strong> In the Console tab, run{" "}
-                    <code className="rounded bg-gray-200 px-1">document.cookie</code>{" "}
-                    and copy the output.
-                  </li>
-                  <li>
-                    <strong>Extension method:</strong> Use a cookie export
-                    extension like &quot;EditThisCookie&quot; and export as JSON.
-                  </li>
-                  <li>
-                    <strong>cURL method:</strong> In the Network tab, right-click
-                    any request to doordash.com &rarr; Copy &rarr; Copy as cURL.
-                    Paste it here — the cookie header will be extracted.
-                  </li>
-                </ul>
+                Right-click the request &rarr; <strong>Copy</strong> &rarr;{" "}
+                <strong>Copy as cURL</strong>.
               </li>
               <li>
-                Paste the result into the text box above and click{" "}
-                <strong>Import Cookies</strong>.
+                Paste the entire thing into the text box above. The cookie
+                header will be extracted automatically.
               </li>
             </ol>
+            <div className="mt-3 border-t border-gray-200 pt-2">
+              <p className="font-medium text-gray-700">Alternative: Console method</p>
+              <ol className="mt-1 list-inside list-decimal space-y-1">
+                <li>In DevTools, go to the <strong>Console</strong> tab.</li>
+                <li>
+                  Type{" "}
+                  <code className="rounded bg-gray-200 px-1">document.cookie</code>{" "}
+                  and press Enter.
+                </li>
+                <li>Copy the output and paste it above.</li>
+              </ol>
+              <p className="mt-1 text-gray-400">
+                Note: <code>document.cookie</code> only shows non-HttpOnly
+                cookies. The cURL method above is more reliable since it
+                captures all cookies including HttpOnly session tokens.
+              </p>
+            </div>
             <p className="mt-2 text-gray-500">
-              Your cookies are stored locally in the browser profile and never
-              sent anywhere except to DoorDash.
+              Your cookies are stored locally and never sent anywhere except to
+              DoorDash.
             </p>
           </details>
+
+          {/* Debug info */}
+          {debugInfo && (
+            <p className="rounded bg-gray-100 p-2 font-mono text-xs text-gray-500">
+              {debugInfo}
+            </p>
+          )}
 
           {error && (
             <p className="text-sm text-red-600">{error}</p>
