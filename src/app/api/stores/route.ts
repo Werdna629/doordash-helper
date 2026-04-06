@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const storeInfo = await getStoreInfo(storeId);
+    const storeInfo = await getStoreInfo(storeId, url);
     if (!storeInfo) {
       return NextResponse.json(
         { error: `Could not fetch info for store ${storeId}` },
