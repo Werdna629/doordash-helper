@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { captureNetworkRequests } from "@/lib/doordash-api";
 
 /**
- * POST /api/debug — Capture GraphQL network requests from a store page.
- * Useful for discovering DoorDash's current GraphQL operations.
+ * POST /api/debug — Capture network requests from a DoorDash page.
+ * Useful for debugging what requests/responses DoorDash makes.
  * Body: { storeUrl: string, durationMs?: number }
  */
 export async function POST(request: NextRequest) {
@@ -21,19 +21,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const operations = await captureNetworkRequests(
+    const requests = await captureNetworkRequests(
       storeUrl,
       durationMs ?? 10_000
     );
 
     return NextResponse.json({
-      capturedOperations: operations.length,
-      operations: operations.map((op) => ({
-        operationName: op.operationName,
-        variables: op.variables,
-        queryPreview: op.query.slice(0, 200) + "...",
-        fullQuery: op.query,
-      })),
+      captured: requests.length,
+      requests,
     });
   } catch (error) {
     return NextResponse.json(

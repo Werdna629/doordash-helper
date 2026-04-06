@@ -4,13 +4,9 @@ import type { SearchResult, Store } from "./types";
 /**
  * DoorDash API client.
  *
- * Instead of guessing GraphQL queries (which break when DoorDash changes
- * their schema), we navigate to real DoorDash pages and either:
- * - Intercept the GraphQL responses the page itself makes, or
- * - Scrape data directly from the rendered page
- *
- * This is more robust since it uses DoorDash's own frontend code to make
- * the right API calls.
+ * DoorDash uses Next.js with React Server Components. Their pages return
+ * `text/x-component` RSC payloads, not JSON APIs. So we navigate to real
+ * DoorDash pages, wait for them to render, and scrape data from the DOM.
  */
 
 // ============================================================
@@ -19,8 +15,6 @@ import type { SearchResult, Store } from "./types";
 
 /**
  * Extract a store ID from a DoorDash store URL.
- * Example URL: https://www.doordash.com/convenience/store/2834013/
- * Example URL: https://www.doordash.com/store/safeway-san-francisco-1235954/
  */
 export function parseStoreIdFromUrl(url: string): string | null {
   const convenienceMatch = url.match(/\/convenience\/store\/(\d+)/);
@@ -36,52 +30,36 @@ export function parseStoreIdFromUrl(url: string): string | null {
 }
 
 /**
- * Get store info by navigating to the store page and scraping it.
- * Also intercepts GraphQL responses to capture fee/delivery info.
+ * Get store info by navigating to the store page and scraping the DOM.
  */
 export async function getStoreInfo(storeId: string, storeUrl: string): Promise<Store | null> {
   try {
     const page = await browserManager.getPage();
 
-    // Collect GraphQL response data as the page loads
-    const graphqlData: Record<string, unknown>[] = [];
-
-    const responseHandler = async (response: { url: () => string; request: () => { method: () => string }; json: () => Promise<unknown> }) => {
-      if (
-        response.url().includes("graphql") &&
-        response.request().method() === "POST"
-      ) {
-        try {
-          const json = await response.json();
-          graphqlData.push(json as Record<string, unknown>);
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    page.on("response", responseHandler);
-
-    // Navigate to the store page
     await page.goto(storeUrl, {
-      waitUntil: "networkidle",
-      timeout: 25_000,
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
     });
 
-    // Wait a bit more for dynamic rendering
-    await page.waitForTimeout(3000);
+    // Wait for the page to render — look for a heading or the store name to appear
+    try {
+      await page.waitForSelector("h1", { timeout: 10_000 });
+    } catch {
+      // If no h1 appears, wait a flat amount and hope for the best
+      await page.waitForTimeout(5000);
+    }
 
-    page.off("response", responseHandler);
-
-    // Extract store name from the page — try multiple strategies
     const pageData = await page.evaluate(() => {
+      // --- Store Name ---
       const getName = () => {
-        // Strategy 1: Page title usually has "StoreName - DoorDash" or "StoreName | DoorDash"
+        // Strategy 1: Page title "StoreName - DoorDash" or "Order from StoreName"
         const title = document.title || "";
-        const titleParts = title.split(/[|\-–—]/);
+        // Split on common separators
+        const titleParts = title.split(/\s+[-|–—]\s+/);
         if (titleParts.length >= 2) {
-          const candidate = titleParts[0].trim();
-          // Filter out generic DoorDash titles
+          const candidate = titleParts[0].trim()
+            .replace(/^Order from\s+/i, "")
+            .replace(/\s+Delivery.*$/i, "");
           if (candidate && !candidate.toLowerCase().includes("doordash") && candidate.length > 1) {
             return candidate;
           }
@@ -95,37 +73,31 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
         const ogTitle = document.querySelector('meta[property="og:title"]');
         if (ogTitle) {
           const content = ogTitle.getAttribute("content") || "";
-          const parts = content.split(/[|\-–—]/);
+          const parts = content.split(/\s+[-|–—]\s+/);
           if (parts[0]?.trim()) return parts[0].trim();
-        }
-
-        // Strategy 4: Look for a prominent store name element
-        const candidates = document.querySelectorAll(
-          '[data-testid*="store-name"], [data-testid*="StoreName"], [class*="StoreName"], [class*="storeName"]'
-        );
-        for (const el of candidates) {
-          if (el.textContent?.trim()) return el.textContent.trim();
         }
 
         return null;
       };
 
+      // --- Fee Info ---
       const bodyText = document.body.innerText || "";
 
       const hasPickup =
-        bodyText.toLowerCase().includes("pickup") &&
+        !!document.querySelector('[data-testid*="pickup" i], [data-testid*="Pickup"], [aria-label*="ickup"]') ||
         (bodyText.toLowerCase().includes("pickup available") ||
-         bodyText.toLowerCase().includes("switch to pickup") ||
-         !!document.querySelector('[data-testid*="pickup"], [data-testid*="Pickup"], [aria-label*="ickup"]'));
+         bodyText.toLowerCase().includes("switch to pickup"));
 
       const freeDeliveryMatch = bodyText.match(
-        /free delivery (?:on orders |over |for orders over )?\$(\d+(?:\.\d{2})?)/i
+        /free delivery[^$]*?\$(\d+(?:\.\d{2})?)/i
+      ) || bodyText.match(
+        /\$0\.00 delivery(?:\s+fee)?\s+(?:on orders |over |for orders? over )?\$(\d+(?:\.\d{2})?)/i
       );
       const deliveryFeeMatch = bodyText.match(
-        /delivery fee[:\s]*\$(\d+(?:\.\d{2})?)/i
+        /\$(\d+\.\d{2})\s+delivery fee/i
       );
       const serviceFeeMatch = bodyText.match(
-        /service fee[:\s]*\$(\d+(?:\.\d{2})?)/i
+        /\$(\d+\.\d{2})\s+service fee/i
       );
 
       return {
@@ -137,88 +109,19 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
       };
     });
 
-    // Also try to extract info from intercepted GraphQL responses
-    const storeInfo = extractStoreInfoFromGraphQL(graphqlData);
-
-    const name = pageData.name || storeInfo.name || `Store ${storeId}`;
-
     return {
       id: storeId,
-      name,
+      name: pageData.name || `Store ${storeId}`,
       url: storeUrl,
-      pickupAvailable: pageData.hasPickup || storeInfo.pickupAvailable || false,
-      freeDeliveryThreshold: pageData.freeDeliveryThreshold ?? storeInfo.freeDeliveryThreshold ?? null,
-      deliveryFee: pageData.deliveryFee ?? storeInfo.deliveryFee ?? null,
-      serviceFeeRate: storeInfo.serviceFeeRate ?? null,
-      minServiceFee: storeInfo.minServiceFee ?? null,
+      pickupAvailable: pageData.hasPickup,
+      freeDeliveryThreshold: pageData.freeDeliveryThreshold,
+      deliveryFee: pageData.deliveryFee,
+      serviceFeeRate: null,
+      minServiceFee: pageData.serviceFee,
     };
   } catch (error) {
     console.error(`Failed to get store info for ${storeId}:`, error);
     return null;
-  }
-}
-
-/** Deep-search GraphQL response data for store-related fields */
-function extractStoreInfoFromGraphQL(responses: Record<string, unknown>[]): Partial<Store> {
-  const info: Partial<Store> = {};
-
-  for (const resp of responses) {
-    const json = JSON.stringify(resp);
-
-    // Try to find store name
-    if (!info.name) {
-      const nameMatch = json.match(/"name"\s*:\s*"([^"]{3,60})"/);
-      if (nameMatch) info.name = nameMatch[1];
-    }
-
-    // Look for fee-related fields anywhere in the response
-    if (json.includes("deliveryFee") || json.includes("serviceFee") || json.includes("fulfillment")) {
-      try {
-        deepExtractFees(resp, info);
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  return info;
-}
-
-/** Recursively search an object for fee-related fields */
-function deepExtractFees(obj: unknown, info: Partial<Store>): void {
-  if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    for (const item of obj) deepExtractFees(item, info);
-    return;
-  }
-
-  const record = obj as Record<string, unknown>;
-
-  // Check for pickup in fulfillment options
-  if (record.type === "PICKUP" || record.fulfillmentType === "PICKUP") {
-    info.pickupAvailable = true;
-  }
-
-  // Extract fee fields
-  if (typeof record.freeDeliveryThreshold === "number" && info.freeDeliveryThreshold === undefined) {
-    info.freeDeliveryThreshold = record.freeDeliveryThreshold;
-  }
-  if (typeof record.deliveryFee === "number" && info.deliveryFee === undefined) {
-    info.deliveryFee = record.deliveryFee;
-  }
-  if (typeof record.serviceFeeRate === "number" && info.serviceFeeRate === undefined) {
-    info.serviceFeeRate = record.serviceFeeRate;
-  }
-  if (typeof record.minServiceFee === "number" && info.minServiceFee === undefined) {
-    info.minServiceFee = record.minServiceFee;
-  }
-
-  // Recurse
-  for (const value of Object.values(record)) {
-    if (value && typeof value === "object") {
-      deepExtractFees(value, info);
-    }
   }
 }
 
@@ -227,12 +130,12 @@ function deepExtractFees(obj: unknown, info: Partial<Store>): void {
 // ============================================================
 
 /**
- * Search for items by navigating to the store's search page on DoorDash.
+ * Search for items by navigating to the store's search page and scraping
+ * rendered results from the DOM.
  *
- * DoorDash's search URL pattern: /convenience/store/{storeId}/search/{query}
- * The page loads and makes its own API calls. We intercept all responses
- * (both GraphQL and regular JSON) to capture results, plus scrape the DOM
- * as a fallback.
+ * DoorDash search URL: /convenience/store/{storeId}/search/{query}
+ * This is a Next.js RSC page — the data comes embedded in the RSC stream,
+ * not as a separate JSON response.
  */
 export async function searchItems(
   storeId: string,
@@ -242,45 +145,29 @@ export async function searchItems(
   try {
     const page = await browserManager.getPage();
 
-    const searchResults: SearchResult[] = [];
-
-    // Intercept ALL responses that might contain search results
-    const responseHandler = async (response: { url: () => string; request: () => { method: () => string }; json: () => Promise<unknown>; text: () => Promise<string> }) => {
-      const url = response.url();
-      const isGraphQL = url.includes("graphql") && response.request().method() === "POST";
-      const isSearchAPI = url.includes("/search") && url.includes(storeId);
-
-      if (isGraphQL || isSearchAPI) {
-        try {
-          const json = (await response.json()) as Record<string, unknown>;
-          const items = extractSearchResultsFromGraphQL(json, storeId);
-          searchResults.push(...items);
-        } catch {
-          // ignore
-        }
-      }
-    };
-
-    page.on("response", responseHandler);
-
-    // Navigate to the store's search page using the correct URL pattern
     const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/${encodeURIComponent(query)}`;
     await page.goto(searchUrl, {
-      waitUntil: "networkidle",
-      timeout: 25_000,
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
     });
 
-    // Wait for search results to render
-    await page.waitForTimeout(3000);
-
-    page.off("response", responseHandler);
-
-    // If we got results from response interception, use those
-    if (searchResults.length > 0) {
-      return searchResults;
+    // Wait for item cards to appear — look for elements with prices
+    try {
+      await page.waitForFunction(
+        () => {
+          const text = document.body.innerText || "";
+          // Check if any price-like string appeared in the body
+          return /\$\d+\.\d{2}/.test(text);
+        },
+        { timeout: 10_000 }
+      );
+      // Give a bit more time for all items to render
+      await page.waitForTimeout(2000);
+    } catch {
+      // If no prices appear, the search might have no results
+      await page.waitForTimeout(3000);
     }
 
-    // Fallback: scrape search results from the rendered page
     return await scrapeSearchResults(page, storeId);
   } catch (error) {
     console.error(
@@ -291,130 +178,97 @@ export async function searchItems(
   }
 }
 
-/** Extract search result items from a GraphQL response */
-function extractSearchResultsFromGraphQL(
-  response: Record<string, unknown>,
-  storeId: string
-): SearchResult[] {
-  const results: SearchResult[] = [];
-  const json = JSON.stringify(response);
-
-  // Only process responses that look like they contain item data
-  if (!json.includes("price") || !json.includes("name")) return results;
-
-  // Recursively find arrays of items
-  findItemArrays(response, storeId, results);
-
-  return results;
-}
-
-/** Recursively find arrays that look like item lists */
-function findItemArrays(
-  obj: unknown,
-  storeId: string,
-  results: SearchResult[]
-): void {
-  if (!obj || typeof obj !== "object") return;
-
-  if (Array.isArray(obj)) {
-    // Check if this array contains item-like objects
-    const itemLike = obj.filter(
-      (item) =>
-        item &&
-        typeof item === "object" &&
-        !Array.isArray(item) &&
-        ("name" in item || "displayName" in item) &&
-        ("price" in item || "displayPrice" in item || "unitPrice" in item)
-    );
-
-    if (itemLike.length > 0) {
-      for (const item of itemLike) {
-        const record = item as Record<string, unknown>;
-        const name = String(record.name || record.displayName || "");
-        if (!name) continue;
-
-        // Skip if we already have this item
-        if (results.some((r) => r.name === name)) continue;
-
-        results.push({
-          itemId: String(record.id ?? record.itemId ?? record.menuItemId ?? `${Date.now()}-${Math.random()}`),
-          storeId,
-          name,
-          description: String(record.description || ""),
-          price: parsePrice(record.displayPrice ?? record.price ?? record.salePrice),
-          unitPrice: record.unitPrice ? String(record.unitPrice) : record.pricePerUnit ? String(record.pricePerUnit) : null,
-          imageUrl: record.imageUrl ? String(record.imageUrl) : record.headerImageUrl ? String(record.headerImageUrl) : record.imgUrl ? String(record.imgUrl) : null,
-          inStock: record.isAvailable !== false && record.isSoldOut !== true,
-        });
-      }
-    }
-
-    for (const item of obj) findItemArrays(item, storeId, results);
-    return;
-  }
-
-  for (const value of Object.values(obj as Record<string, unknown>)) {
-    if (value && typeof value === "object") {
-      findItemArrays(value, storeId, results);
-    }
-  }
-}
-
-/** Scrape search results from the rendered page as a fallback */
+/**
+ * Scrape item cards from the rendered DoorDash page.
+ *
+ * DoorDash renders items as card elements, typically anchor tags with
+ * an image, name text, and a price. We find these by looking for elements
+ * that contain both a $X.XX price and an image.
+ */
 async function scrapeSearchResults(
-  page: { evaluate: (fn: () => Array<{ name: string; price: string; imageUrl: string | null }>) => Promise<Array<{ name: string; price: string; imageUrl: string | null }>> },
+  page: { evaluate: <T>(fn: () => T) => Promise<T> },
   storeId: string
 ): Promise<SearchResult[]> {
   const items = await page.evaluate(() => {
-    const results: Array<{ name: string; price: string; imageUrl: string | null }> = [];
+    const results: Array<{
+      name: string;
+      price: string;
+      imageUrl: string | null;
+      itemId: string | null;
+    }> = [];
     const seen = new Set<string>();
 
-    // DoorDash renders items as clickable cards/links, often inside anchors
-    // Try multiple selectors to find them
-    const selectors = [
+    // Strategy 1: Find item card elements using known selectors
+    const selectorGroups = [
+      // Specific DoorDash data-testid patterns
       '[data-testid*="MenuItem"]',
-      '[data-testid*="item"]',
-      '[data-testid*="product"]',
-      '[data-testid*="Product"]',
+      '[data-testid*="StoreItem"]',
+      '[data-testid*="ItemCard"]',
+      // Links to item pages
       'a[href*="/store/"][href*="/item/"]',
       'a[href*="/convenience/"][href*="/item/"]',
-      '[class*="ItemCard"]',
-      '[class*="ProductCard"]',
-      '[class*="menuItem"]',
     ];
 
-    let candidates: Element[] = [];
-    for (const sel of selectors) {
+    let cards: Element[] = [];
+    for (const sel of selectorGroups) {
       const els = document.querySelectorAll(sel);
       if (els.length > 0) {
-        candidates = Array.from(els);
+        cards = Array.from(els);
         break;
       }
     }
 
-    // If no specific selectors match, try a broader approach:
-    // find all elements that contain both a price-like string and an img
-    if (candidates.length === 0) {
-      const allLinks = document.querySelectorAll("a[href]");
-      candidates = Array.from(allLinks).filter((el) => {
+    // Strategy 2: Broader — find any anchor that has both a price and an image
+    if (cards.length === 0) {
+      const allAnchors = document.querySelectorAll("a[href]");
+      cards = Array.from(allAnchors).filter((el) => {
         const text = el.textContent || "";
-        return text.includes("$") && el.querySelector("img");
+        return /\$\d+\.\d{2}/.test(text) && el.querySelector("img");
       });
     }
 
-    for (const el of candidates) {
+    // Strategy 3: Even broader — any div/article that has a price and image
+    if (cards.length === 0) {
+      const allEls = document.querySelectorAll("div, article, li");
+      cards = Array.from(allEls).filter((el) => {
+        const text = el.textContent || "";
+        if (!/\$\d+\.\d{2}/.test(text)) return false;
+        if (!el.querySelector("img")) return false;
+        // Filter out large containers — item cards are typically small
+        const children = el.querySelectorAll("div, article, li");
+        // If this element contains other potential cards, it's a container, not a card
+        const hasNestedPriceCards = Array.from(children).some(
+          (child) => child !== el && /\$\d+\.\d{2}/.test(child.textContent || "") && child.querySelector("img")
+        );
+        return !hasNestedPriceCards;
+      });
+    }
+
+    for (const el of cards) {
       const text = el.textContent || "";
 
-      // Extract price (look for $X.XX pattern)
-      const priceMatch = text.match(/\$(\d+\.\d{2})/);
-      if (!priceMatch) continue;
-      const price = priceMatch[0];
+      // Extract all prices
+      const priceMatches = text.match(/\$\d+\.\d{2}/g);
+      if (!priceMatches || priceMatches.length === 0) continue;
+      // Use the first price (usually the main price)
+      const price = priceMatches[0];
 
-      // Extract name: get text content but exclude the price portion
-      // Usually the name is the most prominent text before the price
-      const allText = text.replace(/\$\d+\.\d{2}/g, "").trim();
-      // Split by newlines and take the first non-empty line as the name
-      const lines = allText.split(/\n/).map((l) => l.trim()).filter(Boolean);
+      // Extract name: get the text, remove prices, take the first meaningful line
+      let cleanText = text;
+      for (const p of priceMatches) {
+        cleanText = cleanText.replace(p, "");
+      }
+      // Remove common UI text
+      cleanText = cleanText
+        .replace(/add to cart/gi, "")
+        .replace(/out of stock/gi, "")
+        .replace(/each/gi, "")
+        .replace(/\(\d+ (?:ct|oz|fl oz|lb|pk|count)\)/gi, "");
+
+      const lines = cleanText
+        .split(/\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 1);
       const name = lines[0];
       if (!name || name.length < 2) continue;
 
@@ -422,11 +276,20 @@ async function scrapeSearchResults(
       if (seen.has(name)) continue;
       seen.add(name);
 
+      // Extract item ID from href if available
+      let itemId: string | null = null;
+      const anchor = el.tagName === "A" ? el : el.querySelector("a[href]");
+      if (anchor) {
+        const href = anchor.getAttribute("href") || "";
+        const idMatch = href.match(/\/item\/(\d+)/);
+        if (idMatch) itemId = idMatch[1];
+      }
+
       // Find image
       const imgEl = el.querySelector("img");
       const imageUrl = imgEl?.getAttribute("src") || null;
 
-      results.push({ name, price, imageUrl });
+      results.push({ name, price, imageUrl, itemId });
     }
 
     return results;
@@ -434,7 +297,7 @@ async function scrapeSearchResults(
 
   return items.map(
     (item, i): SearchResult => ({
-      itemId: `scraped-${storeId}-${i}`,
+      itemId: item.itemId || `scraped-${storeId}-${i}-${Date.now()}`,
       storeId,
       name: item.name,
       description: "",
@@ -458,70 +321,63 @@ export async function findMatchingItem(
 }
 
 // ============================================================
-// Network Request Capture (for GraphQL query discovery)
+// Network Request Capture (for debugging)
 // ============================================================
 
 /**
- * Navigate to a store page and capture all GraphQL operations made.
- * Useful for debugging and discovering DoorDash's current API.
+ * Navigate to a page and capture all network requests/responses.
+ * Useful for debugging what DoorDash's page is doing.
  */
 export async function captureNetworkRequests(
   storeUrl: string,
   durationMs: number = 10_000
 ): Promise<
   Array<{
-    operationName: string;
-    variables: Record<string, unknown>;
-    query: string;
-    responsePreview?: string;
+    url: string;
+    method: string;
+    contentType: string;
+    responsePreview: string;
   }>
 > {
   const page = await browserManager.getPage();
   const captured: Array<{
-    operationName: string;
-    variables: Record<string, unknown>;
-    query: string;
-    responsePreview?: string;
+    url: string;
+    method: string;
+    contentType: string;
+    responsePreview: string;
   }> = [];
 
-  const requestBodies = new Map<string, { operationName: string; variables: Record<string, unknown>; query: string }>();
-
-  // Capture request bodies
-  page.on("request", (request: { url: () => string; method: () => string; postData: () => string | null; }) => {
-    if (request.url().includes("graphql") && request.method() === "POST") {
+  const responseHandler = async (response: {
+    url: () => string;
+    request: () => { method: () => string };
+    headers: () => Record<string, string>;
+    text: () => Promise<string>;
+  }) => {
+    const url = response.url();
+    // Only capture interesting requests (not static assets)
+    if (
+      url.includes("graphql") ||
+      url.includes("/search") ||
+      url.includes("/store/") ||
+      url.includes("api")
+    ) {
       try {
-        const body = JSON.parse(request.postData() || "{}");
-        requestBodies.set(request.url() + body.operationName, {
-          operationName: body.operationName || "unknown",
-          variables: body.variables || {},
-          query: body.query || "",
-        });
-      } catch { /* ignore */ }
-    }
-  });
-
-  // Capture responses
-  const responseHandler = async (response: { url: () => string; request: () => { method: () => string; postData: () => string | null }; text: () => Promise<string> }) => {
-    if (response.url().includes("graphql") && response.request().method() === "POST") {
-      try {
-        const reqBody = JSON.parse(response.request().postData() || "{}");
-        const key = response.url() + reqBody.operationName;
-        const reqData = requestBodies.get(key);
-        const respText = await response.text();
-
+        const text = await response.text();
         captured.push({
-          operationName: reqData?.operationName || reqBody.operationName || "unknown",
-          variables: reqData?.variables || reqBody.variables || {},
-          query: reqData?.query || reqBody.query || "",
-          responsePreview: respText.slice(0, 500),
+          url,
+          method: response.request().method(),
+          contentType: response.headers()["content-type"] || "unknown",
+          responsePreview: text.slice(0, 500),
         });
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
   };
 
   page.on("response", responseHandler);
 
-  await page.goto(storeUrl, { waitUntil: "networkidle", timeout: 30_000 });
+  await page.goto(storeUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
   await page.waitForTimeout(durationMs);
 
   page.off("response", responseHandler);
