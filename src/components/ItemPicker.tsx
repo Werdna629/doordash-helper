@@ -149,11 +149,13 @@ export default function ItemPicker({ stores, onItemConfirmed }: Props) {
       </div>
 
       {/* Debug: what the browser saw on the search page */}
-      {searchDebug && results.length === 0 && !searching && (
-        <div className="mb-3 rounded border border-yellow-200 bg-yellow-50 p-3">
-          <p className="text-sm font-medium text-yellow-800">No results found. Browser debug info:</p>
-          <pre className="mt-1 max-h-40 overflow-auto text-xs text-yellow-700 whitespace-pre-wrap">{searchDebug}</pre>
-        </div>
+      {searchDebug && !searching && (
+        <details className={`mb-3 rounded border p-3 ${results.length === 0 ? "border-yellow-200 bg-yellow-50" : "border-gray-200 bg-gray-50"}`}>
+          <summary className={`cursor-pointer text-sm font-medium ${results.length === 0 ? "text-yellow-800" : "text-gray-500"}`}>
+            {results.length === 0 ? "No results found — " : ""}Debug: what the browser saw
+          </summary>
+          <pre className="mt-1 max-h-40 overflow-auto text-xs text-gray-600 whitespace-pre-wrap">{searchDebug}</pre>
+        </details>
       )}
 
       {/* Search results — pick exact item */}

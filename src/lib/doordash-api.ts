@@ -30,8 +30,9 @@ export function parseStoreIdFromUrl(url: string): string | null {
 }
 
 /**
- * Get store info by navigating to the store page and scraping the DOM.
- * Returns debug info to help diagnose issues.
+ * Get store info. The store page itself is usually Cloudflare-blocked,
+ * so we navigate to a search page (which works) and extract the store
+ * name from the page title / breadcrumbs.
  */
 export async function getStoreInfo(
   storeId: string,
@@ -40,59 +41,85 @@ export async function getStoreInfo(
   try {
     const page = await browserManager.getPage();
 
-    await page.goto(storeUrl, {
+    // Navigate to a search page — these bypass Cloudflare unlike store pages
+    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/a`;
+    await page.goto(searchUrl, {
       waitUntil: "domcontentloaded",
       timeout: 20_000,
     });
 
-    // Wait for the page to render — look for a heading to appear
+    // Wait for the page to render
     try {
-      await page.waitForSelector("h1", { timeout: 8_000 });
+      await page.waitForFunction(
+        () => {
+          const body = document.body.innerText || "";
+          // Wait until we see prices or meaningful content
+          return /\$\d+\.\d{2}/.test(body) || body.length > 200;
+        },
+        { timeout: 10_000 }
+      );
+      await page.waitForTimeout(1500);
     } catch {
       await page.waitForTimeout(3000);
     }
 
     const pageData = await page.evaluate(() => {
-      const title = document.title || "(empty title)";
-      const h1 = document.querySelector("h1")?.textContent?.trim() || "(no h1)";
-      const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "(no og:title)";
-      const bodyPreview = (document.body.innerText || "").slice(0, 500);
+      const title = document.title || "";
+      const bodyText = document.body.innerText || "";
       const url = window.location.href;
 
       // --- Store Name ---
       const getName = () => {
-        // Strategy 1: Page title "StoreName - DoorDash" or similar
-        const titleParts = title.split(/\s+[-|–—]\s+/);
-        if (titleParts.length >= 2) {
-          const candidate = titleParts[0].trim()
-            .replace(/^Order from\s+/i, "")
-            .replace(/\s+Delivery.*$/i, "");
-          if (candidate && !candidate.toLowerCase().includes("doordash") && candidate.length > 1) {
-            return candidate;
+        // Strategy 1: Page title often contains store name
+        // e.g., "Target - Search Results - DoorDash" or "Search a at Target"
+        if (title) {
+          // "StoreName - ..." pattern
+          const dashParts = title.split(/\s+[-|–—]\s+/);
+          for (const part of dashParts) {
+            const cleaned = part.trim()
+              .replace(/^Order from\s+/i, "")
+              .replace(/\s+Delivery.*$/i, "")
+              .replace(/^Search\s+.*\s+at\s+/i, "");
+            if (cleaned && cleaned.length > 1 &&
+                !cleaned.toLowerCase().includes("doordash") &&
+                !cleaned.toLowerCase().includes("search") &&
+                cleaned !== "a") {
+              return cleaned;
+            }
+          }
+          // "Search X at StoreName" pattern
+          const atMatch = title.match(/at\s+([^-–—|]+)/i);
+          if (atMatch) {
+            const name = atMatch[1].trim();
+            if (name && !name.toLowerCase().includes("doordash")) return name;
           }
         }
 
-        // Strategy 2: h1 tag (but not if it's generic)
-        const h1El = document.querySelector("h1");
-        const h1Text = h1El?.textContent?.trim();
-        if (h1Text && h1Text.length > 1 && !h1Text.toLowerCase().includes("doordash")) {
-          return h1Text;
-        }
-
-        // Strategy 3: og:title meta tag
+        // Strategy 2: og:title
         const ogEl = document.querySelector('meta[property="og:title"]');
         if (ogEl) {
           const content = ogEl.getAttribute("content") || "";
           const parts = content.split(/\s+[-|–—]\s+/);
-          if (parts[0]?.trim() && !parts[0].toLowerCase().includes("doordash")) {
-            return parts[0].trim();
+          for (const part of parts) {
+            const cleaned = part.trim();
+            if (cleaned && cleaned.length > 1 && !cleaned.toLowerCase().includes("doordash")) {
+              return cleaned;
+            }
           }
+        }
+
+        // Strategy 3: Look for breadcrumb or header with store name
+        const h1 = document.querySelector("h1")?.textContent?.trim();
+        if (h1 && h1.length > 1 &&
+            !h1.toLowerCase().includes("doordash") &&
+            !h1.toLowerCase().includes("just a moment") &&
+            !h1.toLowerCase().includes("www.")) {
+          return h1;
         }
 
         return null;
       };
 
-      const bodyText = document.body.innerText || "";
       const hasPickup =
         !!document.querySelector('[data-testid*="pickup" i], [data-testid*="Pickup"], [aria-label*="ickup"]') ||
         bodyText.toLowerCase().includes("pickup available") ||
@@ -108,12 +135,15 @@ export async function getStoreInfo(
         freeDeliveryThreshold: freeDeliveryMatch ? parseFloat(freeDeliveryMatch[1]) : null,
         deliveryFee: deliveryFeeMatch ? parseFloat(deliveryFeeMatch[1]) : null,
         serviceFee: serviceFeeMatch ? parseFloat(serviceFeeMatch[1]) : null,
-        // Debug info
-        debug: { title, h1, ogTitle, url, bodyPreview },
+        debug: {
+          title,
+          url,
+          bodyPreview: bodyText.slice(0, 500),
+        },
       };
     });
 
-    const debug = `title="${pageData.debug.title}" | h1="${pageData.debug.h1}" | og:title="${pageData.debug.ogTitle}" | url=${pageData.debug.url} | body="${pageData.debug.bodyPreview.slice(0, 200)}"`;
+    const debug = `title="${pageData.debug.title}" | url=${pageData.debug.url} | body="${pageData.debug.bodyPreview.slice(0, 300)}"`;
 
     const store: Store = {
       id: storeId,
@@ -167,28 +197,42 @@ export async function searchItems(
         },
         { timeout: 10_000 }
       );
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
     } catch {
       await page.waitForTimeout(3000);
     }
 
+    // Scroll down to trigger lazy loading of more items
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+    });
+    await page.waitForTimeout(1500);
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+    });
+
     // Capture debug info about what the page looks like
     const debugInfo = await page.evaluate(() => {
       const title = document.title || "(empty title)";
-      const h1 = document.querySelector("h1")?.textContent?.trim() || "(no h1)";
       const url = window.location.href;
       const bodyPreview = (document.body.innerText || "").slice(0, 500);
       const imgCount = document.querySelectorAll("img").length;
       const anchorCount = document.querySelectorAll("a[href]").length;
       const priceMatches = (document.body.innerText || "").match(/\$\d+\.\d{2}/g);
+      // Dump all img alt attributes to help debug item names
+      const imgAlts = Array.from(document.querySelectorAll("img[alt]"))
+        .map(img => img.getAttribute("alt"))
+        .filter(alt => alt && alt.length > 2)
+        .slice(0, 15);
       return {
-        title, h1, url, bodyPreview,
+        title, url, bodyPreview,
         imgCount, anchorCount,
         priceCount: priceMatches?.length ?? 0,
+        imgAlts,
       };
     });
 
-    const debug = `title="${debugInfo.title}" | h1="${debugInfo.h1}" | url=${debugInfo.url} | imgs=${debugInfo.imgCount} | anchors=${debugInfo.anchorCount} | prices=${debugInfo.priceCount} | body="${debugInfo.bodyPreview.slice(0, 300)}"`;
+    const debug = `title="${debugInfo.title}" | url=${debugInfo.url} | imgs=${debugInfo.imgCount} | anchors=${debugInfo.anchorCount} | prices=${debugInfo.priceCount} | imgAlts=${JSON.stringify(debugInfo.imgAlts)} | body="${debugInfo.bodyPreview.slice(0, 200)}"`;
 
     const results = await scrapeSearchResults(page, storeId);
     return { results, debug };
@@ -200,9 +244,12 @@ export async function searchItems(
 /**
  * Scrape item cards from the rendered DoorDash page.
  *
- * DoorDash renders items as card elements, typically anchor tags with
- * an image, name text, and a price. We find these by looking for elements
- * that contain both a $X.XX price and an image.
+ * Uses two approaches:
+ * 1. Find anchor links to item pages — most reliable
+ * 2. Fall back to finding elements with prices + images
+ *
+ * For item names, prefers img alt attributes over textContent
+ * since textContent includes promotional badges, counts, and stock text.
  */
 async function scrapeSearchResults(
   page: { evaluate: <T>(fn: () => T) => Promise<T> },
@@ -217,85 +264,50 @@ async function scrapeSearchResults(
     }> = [];
     const seen = new Set<string>();
 
-    // Strategy 1: Find item card elements using known selectors
-    const selectorGroups = [
-      // Specific DoorDash data-testid patterns
-      '[data-testid*="MenuItem"]',
-      '[data-testid*="StoreItem"]',
-      '[data-testid*="ItemCard"]',
-      // Links to item pages
-      'a[href*="/store/"][href*="/item/"]',
-      'a[href*="/convenience/"][href*="/item/"]',
-    ];
-
+    // --- Find item card containers ---
     let cards: Element[] = [];
-    for (const sel of selectorGroups) {
-      const els = document.querySelectorAll(sel);
-      if (els.length > 0) {
-        cards = Array.from(els);
-        break;
+
+    // Strategy 1: Links to item pages (most reliable)
+    const itemLinks = document.querySelectorAll(
+      'a[href*="/item/"], a[href*="/store/"][href*="/item/"]'
+    );
+    if (itemLinks.length > 0) {
+      cards = Array.from(itemLinks);
+    }
+
+    // Strategy 2: data-testid patterns
+    if (cards.length === 0) {
+      for (const sel of [
+        '[data-testid*="MenuItem"]',
+        '[data-testid*="StoreItem"]',
+        '[data-testid*="ItemCard"]',
+      ]) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) { cards = Array.from(els); break; }
       }
     }
 
-    // Strategy 2: Broader — find any anchor that has both a price and an image
+    // Strategy 3: Anchors with price + image
     if (cards.length === 0) {
-      const allAnchors = document.querySelectorAll("a[href]");
-      cards = Array.from(allAnchors).filter((el) => {
+      cards = Array.from(document.querySelectorAll("a[href]")).filter(el => {
         const text = el.textContent || "";
         return /\$\d+\.\d{2}/.test(text) && el.querySelector("img");
       });
     }
 
-    // Strategy 3: Even broader — any div/article that has a price and image
+    // Strategy 4: Leaf divs with price + image (no nested price-cards)
     if (cards.length === 0) {
-      const allEls = document.querySelectorAll("div, article, li");
-      cards = Array.from(allEls).filter((el) => {
+      cards = Array.from(document.querySelectorAll("div, article, li")).filter(el => {
         const text = el.textContent || "";
-        if (!/\$\d+\.\d{2}/.test(text)) return false;
-        if (!el.querySelector("img")) return false;
-        // Filter out large containers — item cards are typically small
-        const children = el.querySelectorAll("div, article, li");
-        // If this element contains other potential cards, it's a container, not a card
-        const hasNestedPriceCards = Array.from(children).some(
-          (child) => child !== el && /\$\d+\.\d{2}/.test(child.textContent || "") && child.querySelector("img")
+        if (!/\$\d+\.\d{2}/.test(text) || !el.querySelector("img")) return false;
+        return !Array.from(el.querySelectorAll("div, article, li")).some(
+          child => child !== el && /\$\d+\.\d{2}/.test(child.textContent || "") && child.querySelector("img")
         );
-        return !hasNestedPriceCards;
       });
     }
 
     for (const el of cards) {
-      const text = el.textContent || "";
-
-      // Extract all prices
-      const priceMatches = text.match(/\$\d+\.\d{2}/g);
-      if (!priceMatches || priceMatches.length === 0) continue;
-      // Use the first price (usually the main price)
-      const price = priceMatches[0];
-
-      // Extract name: get the text, remove prices, take the first meaningful line
-      let cleanText = text;
-      for (const p of priceMatches) {
-        cleanText = cleanText.replace(p, "");
-      }
-      // Remove common UI text
-      cleanText = cleanText
-        .replace(/add to cart/gi, "")
-        .replace(/out of stock/gi, "")
-        .replace(/each/gi, "")
-        .replace(/\(\d+ (?:ct|oz|fl oz|lb|pk|count)\)/gi, "");
-
-      const lines = cleanText
-        .split(/\n/)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 1);
-      const name = lines[0];
-      if (!name || name.length < 2) continue;
-
-      // Deduplicate
-      if (seen.has(name)) continue;
-      seen.add(name);
-
-      // Extract item ID from href if available
+      // --- Extract item ID from href ---
       let itemId: string | null = null;
       const anchor = el.tagName === "A" ? el : el.querySelector("a[href]");
       if (anchor) {
@@ -304,9 +316,54 @@ async function scrapeSearchResults(
         if (idMatch) itemId = idMatch[1];
       }
 
-      // Find image
+      // --- Extract image URL and name from alt ---
       const imgEl = el.querySelector("img");
       const imageUrl = imgEl?.getAttribute("src") || null;
+      const imgAlt = imgEl?.getAttribute("alt")?.trim() || null;
+
+      // --- Extract price ---
+      // Look for the price — prefer the last $X.XX which is usually the display price
+      const text = el.textContent || "";
+      const priceMatches = text.match(/\$\d+\.\d{2}/g);
+      if (!priceMatches || priceMatches.length === 0) continue;
+      // Use the last price (display price) — earlier ones may be original/strikethrough prices
+      const price = priceMatches[priceMatches.length - 1];
+
+      // --- Extract name ---
+      let name = "";
+
+      // Best: use img alt (clean item name without promo text)
+      if (imgAlt && imgAlt.length > 3 && !imgAlt.toLowerCase().includes("doordash")) {
+        name = imgAlt;
+      } else {
+        // Fallback: clean up textContent
+        let cleanText = text;
+        for (const p of priceMatches) {
+          cleanText = cleanText.replace(p, "");
+        }
+        cleanText = cleanText
+          .replace(/buy \d+,?\s*save\s+with\s+coupon/gi, "")
+          .replace(/buy \d+,?\s*get \d+\s+free/gi, "")
+          .replace(/save\s+\$\d+(\.\d{2})?/gi, "")
+          .replace(/add to cart/gi, "")
+          .replace(/out of stock/gi, "")
+          .replace(/many in stock/gi, "")
+          .replace(/few left/gi, "")
+          .replace(/limited stock/gi, "")
+          .replace(/\b\d+\s*ct\b/gi, "")
+          .replace(/each/gi, "")
+          .replace(/sponsored/gi, "");
+
+        const lines = cleanText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
+        name = lines[0] || "";
+      }
+
+      if (!name || name.length < 2) continue;
+
+      // Deduplicate by name or itemId
+      const dedupeKey = itemId || name;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
 
       results.push({ name, price, imageUrl, itemId });
     }
