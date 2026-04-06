@@ -27,10 +27,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const storeInfo = await getStoreInfo(storeId, url);
+    const { store: storeInfo, debug } = await getStoreInfo(storeId, url);
     if (!storeInfo) {
       return NextResponse.json(
-        { error: `Could not fetch info for store ${storeId}` },
+        { error: `Could not fetch info for store ${storeId}`, debug },
         { status: 404 }
       );
     }
@@ -38,7 +38,7 @@ export async function POST(request: NextRequest) {
     // Override URL with the user-provided one
     const store: Store = { ...storeInfo, url };
 
-    return NextResponse.json(store);
+    return NextResponse.json({ ...store, debug });
   } catch (error) {
     return NextResponse.json(
       { error: String(error) },

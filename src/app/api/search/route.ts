@@ -21,8 +21,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const results = await searchItems(storeId, query, limit ?? 10);
-    return NextResponse.json({ results });
+    const { results, debug } = await searchItems(storeId, query, limit ?? 10);
+    return NextResponse.json({ results, debug });
   } catch (error) {
     return NextResponse.json(
       { error: String(error) },

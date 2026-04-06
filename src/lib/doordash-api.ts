@@ -31,8 +31,12 @@ export function parseStoreIdFromUrl(url: string): string | null {
 
 /**
  * Get store info by navigating to the store page and scraping the DOM.
+ * Returns debug info to help diagnose issues.
  */
-export async function getStoreInfo(storeId: string, storeUrl: string): Promise<Store | null> {
+export async function getStoreInfo(
+  storeId: string,
+  storeUrl: string
+): Promise<{ store: Store | null; debug: string }> {
   try {
     const page = await browserManager.getPage();
 
@@ -41,20 +45,23 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
       timeout: 20_000,
     });
 
-    // Wait for the page to render — look for a heading or the store name to appear
+    // Wait for the page to render — look for a heading to appear
     try {
-      await page.waitForSelector("h1", { timeout: 10_000 });
+      await page.waitForSelector("h1", { timeout: 8_000 });
     } catch {
-      // If no h1 appears, wait a flat amount and hope for the best
-      await page.waitForTimeout(5000);
+      await page.waitForTimeout(3000);
     }
 
     const pageData = await page.evaluate(() => {
+      const title = document.title || "(empty title)";
+      const h1 = document.querySelector("h1")?.textContent?.trim() || "(no h1)";
+      const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute("content") || "(no og:title)";
+      const bodyPreview = (document.body.innerText || "").slice(0, 500);
+      const url = window.location.href;
+
       // --- Store Name ---
       const getName = () => {
-        // Strategy 1: Page title "StoreName - DoorDash" or "Order from StoreName"
-        const title = document.title || "";
-        // Split on common separators
+        // Strategy 1: Page title "StoreName - DoorDash" or similar
         const titleParts = title.split(/\s+[-|–—]\s+/);
         if (titleParts.length >= 2) {
           const candidate = titleParts[0].trim()
@@ -65,40 +72,35 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
           }
         }
 
-        // Strategy 2: h1 tag
-        const h1 = document.querySelector("h1");
-        if (h1?.textContent?.trim()) return h1.textContent.trim();
+        // Strategy 2: h1 tag (but not if it's generic)
+        const h1El = document.querySelector("h1");
+        const h1Text = h1El?.textContent?.trim();
+        if (h1Text && h1Text.length > 1 && !h1Text.toLowerCase().includes("doordash")) {
+          return h1Text;
+        }
 
         // Strategy 3: og:title meta tag
-        const ogTitle = document.querySelector('meta[property="og:title"]');
-        if (ogTitle) {
-          const content = ogTitle.getAttribute("content") || "";
+        const ogEl = document.querySelector('meta[property="og:title"]');
+        if (ogEl) {
+          const content = ogEl.getAttribute("content") || "";
           const parts = content.split(/\s+[-|–—]\s+/);
-          if (parts[0]?.trim()) return parts[0].trim();
+          if (parts[0]?.trim() && !parts[0].toLowerCase().includes("doordash")) {
+            return parts[0].trim();
+          }
         }
 
         return null;
       };
 
-      // --- Fee Info ---
       const bodyText = document.body.innerText || "";
-
       const hasPickup =
         !!document.querySelector('[data-testid*="pickup" i], [data-testid*="Pickup"], [aria-label*="ickup"]') ||
-        (bodyText.toLowerCase().includes("pickup available") ||
-         bodyText.toLowerCase().includes("switch to pickup"));
+        bodyText.toLowerCase().includes("pickup available") ||
+        bodyText.toLowerCase().includes("switch to pickup");
 
-      const freeDeliveryMatch = bodyText.match(
-        /free delivery[^$]*?\$(\d+(?:\.\d{2})?)/i
-      ) || bodyText.match(
-        /\$0\.00 delivery(?:\s+fee)?\s+(?:on orders |over |for orders? over )?\$(\d+(?:\.\d{2})?)/i
-      );
-      const deliveryFeeMatch = bodyText.match(
-        /\$(\d+\.\d{2})\s+delivery fee/i
-      );
-      const serviceFeeMatch = bodyText.match(
-        /\$(\d+\.\d{2})\s+service fee/i
-      );
+      const freeDeliveryMatch = bodyText.match(/free delivery[^$]*?\$(\d+(?:\.\d{2})?)/i);
+      const deliveryFeeMatch = bodyText.match(/\$(\d+\.\d{2})\s+delivery fee/i);
+      const serviceFeeMatch = bodyText.match(/\$(\d+\.\d{2})\s+service fee/i);
 
       return {
         name: getName(),
@@ -106,10 +108,14 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
         freeDeliveryThreshold: freeDeliveryMatch ? parseFloat(freeDeliveryMatch[1]) : null,
         deliveryFee: deliveryFeeMatch ? parseFloat(deliveryFeeMatch[1]) : null,
         serviceFee: serviceFeeMatch ? parseFloat(serviceFeeMatch[1]) : null,
+        // Debug info
+        debug: { title, h1, ogTitle, url, bodyPreview },
       };
     });
 
-    return {
+    const debug = `title="${pageData.debug.title}" | h1="${pageData.debug.h1}" | og:title="${pageData.debug.ogTitle}" | url=${pageData.debug.url} | body="${pageData.debug.bodyPreview.slice(0, 200)}"`;
+
+    const store: Store = {
       id: storeId,
       name: pageData.name || `Store ${storeId}`,
       url: storeUrl,
@@ -119,9 +125,10 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
       serviceFeeRate: null,
       minServiceFee: pageData.serviceFee,
     };
+
+    return { store, debug };
   } catch (error) {
-    console.error(`Failed to get store info for ${storeId}:`, error);
-    return null;
+    return { store: null, debug: `Error: ${error}` };
   }
 }
 
@@ -141,7 +148,7 @@ export async function searchItems(
   storeId: string,
   query: string,
   _limit: number = 10
-): Promise<SearchResult[]> {
+): Promise<{ results: SearchResult[]; debug: string }> {
   try {
     const page = await browserManager.getPage();
 
@@ -156,25 +163,37 @@ export async function searchItems(
       await page.waitForFunction(
         () => {
           const text = document.body.innerText || "";
-          // Check if any price-like string appeared in the body
           return /\$\d+\.\d{2}/.test(text);
         },
         { timeout: 10_000 }
       );
-      // Give a bit more time for all items to render
       await page.waitForTimeout(2000);
     } catch {
-      // If no prices appear, the search might have no results
       await page.waitForTimeout(3000);
     }
 
-    return await scrapeSearchResults(page, storeId);
+    // Capture debug info about what the page looks like
+    const debugInfo = await page.evaluate(() => {
+      const title = document.title || "(empty title)";
+      const h1 = document.querySelector("h1")?.textContent?.trim() || "(no h1)";
+      const url = window.location.href;
+      const bodyPreview = (document.body.innerText || "").slice(0, 500);
+      const imgCount = document.querySelectorAll("img").length;
+      const anchorCount = document.querySelectorAll("a[href]").length;
+      const priceMatches = (document.body.innerText || "").match(/\$\d+\.\d{2}/g);
+      return {
+        title, h1, url, bodyPreview,
+        imgCount, anchorCount,
+        priceCount: priceMatches?.length ?? 0,
+      };
+    });
+
+    const debug = `title="${debugInfo.title}" | h1="${debugInfo.h1}" | url=${debugInfo.url} | imgs=${debugInfo.imgCount} | anchors=${debugInfo.anchorCount} | prices=${debugInfo.priceCount} | body="${debugInfo.bodyPreview.slice(0, 300)}"`;
+
+    const results = await scrapeSearchResults(page, storeId);
+    return { results, debug };
   } catch (error) {
-    console.error(
-      `Failed to search items at store ${storeId} for "${query}":`,
-      error
-    );
-    return [];
+    return { results: [], debug: `Error: ${error}` };
   }
 }
 
@@ -317,7 +336,8 @@ export async function findMatchingItem(
   itemName: string,
   limit: number = 5
 ): Promise<SearchResult[]> {
-  return searchItems(storeId, itemName, limit);
+  const { results } = await searchItems(storeId, itemName, limit);
+  return results;
 }
 
 // ============================================================

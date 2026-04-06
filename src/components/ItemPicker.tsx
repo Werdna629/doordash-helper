@@ -25,11 +25,13 @@ export default function ItemPicker({ stores, onItemConfirmed }: Props) {
   const [selectedMatches, setSelectedMatches] = useState<
     Record<string, SearchResult | null>
   >({});
+  const [searchDebug, setSearchDebug] = useState<string | null>(null);
 
   const handleSearch = async () => {
     if (!query.trim() || !searchStoreId) return;
     setSearching(true);
     setResults([]);
+    setSearchDebug(null);
     setMatchingItem(null);
     setCrossStoreMatches({});
 
@@ -41,6 +43,7 @@ export default function ItemPicker({ stores, onItemConfirmed }: Props) {
       });
       const data = await res.json();
       setResults(data.results || []);
+      if (data.debug) setSearchDebug(data.debug);
     } catch {
       // ignore
     } finally {
@@ -144,6 +147,14 @@ export default function ItemPicker({ stores, onItemConfirmed }: Props) {
           {searching ? "Searching..." : "Search"}
         </button>
       </div>
+
+      {/* Debug: what the browser saw on the search page */}
+      {searchDebug && results.length === 0 && !searching && (
+        <div className="mb-3 rounded border border-yellow-200 bg-yellow-50 p-3">
+          <p className="text-sm font-medium text-yellow-800">No results found. Browser debug info:</p>
+          <pre className="mt-1 max-h-40 overflow-auto text-xs text-yellow-700 whitespace-pre-wrap">{searchDebug}</pre>
+        </div>
+      )}
 
       {/* Search results — pick exact item */}
       {results.length > 0 && !matchingItem && (

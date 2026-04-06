@@ -12,11 +12,13 @@ export default function StoreSelector({ stores, onStoresChange }: Props) {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<string | null>(null);
 
   const addStore = async () => {
     if (!url.trim()) return;
     setLoading(true);
     setError(null);
+    setDebugInfo(null);
 
     try {
       const res = await fetch("/api/stores", {
@@ -26,6 +28,8 @@ export default function StoreSelector({ stores, onStoresChange }: Props) {
       });
 
       const data = await res.json();
+
+      if (data.debug) setDebugInfo(data.debug);
 
       if (!res.ok) {
         setError(data.error || "Failed to add store");
@@ -113,6 +117,13 @@ export default function StoreSelector({ stores, onStoresChange }: Props) {
       </div>
 
       {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+
+      {debugInfo && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs text-gray-400">Debug: what the browser saw</summary>
+          <pre className="mt-1 max-h-40 overflow-auto rounded bg-gray-100 p-2 text-xs text-gray-600 whitespace-pre-wrap">{debugInfo}</pre>
+        </details>
+      )}
     </div>
   );
 }
