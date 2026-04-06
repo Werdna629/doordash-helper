@@ -204,6 +204,55 @@ class BrowserManager {
     );
   }
 
+  /**
+   * Execute a fetch request inside the browser context and return the raw text.
+   * Used for DoorDash RSC (text/x-component) responses.
+   *
+   * Ensures the page is on a DoorDash origin first so cookies are sent.
+   */
+  async browserFetchText(
+    url: string,
+    headers: Record<string, string> = {}
+  ): Promise<{ text: string; status: number; contentType: string }> {
+    const page = await this.getPage();
+
+    // Ensure we're on the DoorDash origin so cookies are sent.
+    // Navigate to about:blank first if needed, then to a minimal DoorDash page.
+    const currentUrl = page.url();
+    if (!currentUrl.includes("doordash.com")) {
+      // Navigate to the DoorDash homepage — even if Cloudflare blocks it,
+      // the origin will be set and cookies will be available for fetch().
+      try {
+        await page.goto("https://www.doordash.com/home/", {
+          waitUntil: "domcontentloaded",
+          timeout: 10_000,
+        });
+      } catch {
+        // Timeout is fine — we just need the origin set
+      }
+    }
+
+    return page.evaluate(
+      async ({ url, headers }) => {
+        const resp = await fetch(url, {
+          method: "GET",
+          headers: {
+            ...headers,
+          },
+          credentials: "include",
+        });
+
+        const text = await resp.text();
+        return {
+          text,
+          status: resp.status,
+          contentType: resp.headers.get("content-type") || "unknown",
+        };
+      },
+      { url, headers }
+    );
+  }
+
   /** Close the browser. */
   async close(): Promise<void> {
     if (this.context) {

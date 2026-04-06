@@ -4,10 +4,23 @@ import type { SearchResult, Store } from "./types";
 /**
  * DoorDash API client.
  *
- * DoorDash uses Next.js with React Server Components. Their pages return
- * `text/x-component` RSC payloads, not JSON APIs. So we navigate to real
- * DoorDash pages, wait for them to render, and scrape data from the DOM.
+ * DoorDash uses Next.js with React Server Components (RSC). Page navigations
+ * are blocked by Cloudflare bot detection, but in-browser fetch() requests
+ * with RSC headers bypass this and return parseable text/x-component payloads.
+ *
+ * We run fetch() inside the Patchright browser context so that:
+ * - Cookies are automatically included (same origin)
+ * - TLS fingerprint matches a real browser
+ * - Cloudflare doesn't intercept XHR/fetch the same way as navigations
  */
+
+// RSC headers that DoorDash's Next.js expects
+const RSC_HEADERS: Record<string, string> = {
+  Accept: "text/x-component",
+  RSC: "1",
+  "Next-Router-State-Tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(main)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D",
+  "Next-Url": "/",
+};
 
 // ============================================================
 // Store Info
@@ -30,130 +43,39 @@ export function parseStoreIdFromUrl(url: string): string | null {
 }
 
 /**
- * Get store info. The store page itself is usually Cloudflare-blocked,
- * so we navigate to a search page (which works) and extract the store
- * name from the page title / breadcrumbs.
+ * Get store info by fetching the store page as an RSC payload and parsing it.
  */
 export async function getStoreInfo(
   storeId: string,
   storeUrl: string
 ): Promise<{ store: Store | null; debug: string }> {
   try {
-    const page = await browserManager.getPage();
-
-    // Navigate to a search page — these bypass Cloudflare unlike store pages
-    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/a`;
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 20_000,
+    const rscUrl = storeUrl.endsWith("/") ? storeUrl : storeUrl + "/";
+    const result = await browserManager.browserFetchText(rscUrl, {
+      ...RSC_HEADERS,
+      "Next-Url": `/convenience/store/${storeId}`,
     });
 
-    // Wait for the page to render
-    try {
-      await page.waitForFunction(
-        () => {
-          const body = document.body.innerText || "";
-          // Wait until we see prices or meaningful content
-          return /\$\d+\.\d{2}/.test(body) || body.length > 200;
-        },
-        { timeout: 10_000 }
-      );
-      await page.waitForTimeout(1500);
-    } catch {
-      await page.waitForTimeout(3000);
+    const debug = `status=${result.status} | contentType=${result.contentType} | length=${result.text.length} | preview="${result.text.slice(0, 500)}"`;
+
+    if (result.status !== 200 || result.text.length < 50) {
+      return { store: null, debug: `Fetch failed: ${debug}` };
     }
 
-    const pageData = await page.evaluate(() => {
-      const title = document.title || "";
-      const bodyText = document.body.innerText || "";
-      const url = window.location.href;
-
-      // --- Store Name ---
-      const getName = () => {
-        // Strategy 1: Page title often contains store name
-        // e.g., "Target - Search Results - DoorDash" or "Search a at Target"
-        if (title) {
-          // "StoreName - ..." pattern
-          const dashParts = title.split(/\s+[-|–—]\s+/);
-          for (const part of dashParts) {
-            const cleaned = part.trim()
-              .replace(/^Order from\s+/i, "")
-              .replace(/\s+Delivery.*$/i, "")
-              .replace(/^Search\s+.*\s+at\s+/i, "");
-            if (cleaned && cleaned.length > 1 &&
-                !cleaned.toLowerCase().includes("doordash") &&
-                !cleaned.toLowerCase().includes("search") &&
-                cleaned !== "a") {
-              return cleaned;
-            }
-          }
-          // "Search X at StoreName" pattern
-          const atMatch = title.match(/at\s+([^-–—|]+)/i);
-          if (atMatch) {
-            const name = atMatch[1].trim();
-            if (name && !name.toLowerCase().includes("doordash")) return name;
-          }
-        }
-
-        // Strategy 2: og:title
-        const ogEl = document.querySelector('meta[property="og:title"]');
-        if (ogEl) {
-          const content = ogEl.getAttribute("content") || "";
-          const parts = content.split(/\s+[-|–—]\s+/);
-          for (const part of parts) {
-            const cleaned = part.trim();
-            if (cleaned && cleaned.length > 1 && !cleaned.toLowerCase().includes("doordash")) {
-              return cleaned;
-            }
-          }
-        }
-
-        // Strategy 3: Look for breadcrumb or header with store name
-        const h1 = document.querySelector("h1")?.textContent?.trim();
-        if (h1 && h1.length > 1 &&
-            !h1.toLowerCase().includes("doordash") &&
-            !h1.toLowerCase().includes("just a moment") &&
-            !h1.toLowerCase().includes("www.")) {
-          return h1;
-        }
-
-        return null;
-      };
-
-      const hasPickup =
-        !!document.querySelector('[data-testid*="pickup" i], [data-testid*="Pickup"], [aria-label*="ickup"]') ||
-        bodyText.toLowerCase().includes("pickup available") ||
-        bodyText.toLowerCase().includes("switch to pickup");
-
-      const freeDeliveryMatch = bodyText.match(/free delivery[^$]*?\$(\d+(?:\.\d{2})?)/i);
-      const deliveryFeeMatch = bodyText.match(/\$(\d+\.\d{2})\s+delivery fee/i);
-      const serviceFeeMatch = bodyText.match(/\$(\d+\.\d{2})\s+service fee/i);
-
-      return {
-        name: getName(),
-        hasPickup,
-        freeDeliveryThreshold: freeDeliveryMatch ? parseFloat(freeDeliveryMatch[1]) : null,
-        deliveryFee: deliveryFeeMatch ? parseFloat(deliveryFeeMatch[1]) : null,
-        serviceFee: serviceFeeMatch ? parseFloat(serviceFeeMatch[1]) : null,
-        debug: {
-          title,
-          url,
-          bodyPreview: bodyText.slice(0, 500),
-        },
-      };
-    });
-
-    const debug = `title="${pageData.debug.title}" | url=${pageData.debug.url} | body="${pageData.debug.bodyPreview.slice(0, 300)}"`;
+    // Parse store info from the RSC payload
+    const parsed = parseRscPayload(result.text);
+    const storeName = extractStoreName(parsed, result.text) || `Store ${storeId}`;
+    const storeDetails = extractStoreDetails(parsed, result.text);
 
     const store: Store = {
       id: storeId,
-      name: pageData.name || `Store ${storeId}`,
+      name: storeName,
       url: storeUrl,
-      pickupAvailable: pageData.hasPickup,
-      freeDeliveryThreshold: pageData.freeDeliveryThreshold,
-      deliveryFee: pageData.deliveryFee,
+      pickupAvailable: storeDetails.pickupAvailable,
+      freeDeliveryThreshold: storeDetails.freeDeliveryThreshold,
+      deliveryFee: storeDetails.deliveryFee,
       serviceFeeRate: null,
-      minServiceFee: pageData.serviceFee,
+      minServiceFee: storeDetails.minServiceFee,
     };
 
     return { store, debug };
@@ -167,12 +89,9 @@ export async function getStoreInfo(
 // ============================================================
 
 /**
- * Search for items by navigating to the store's search page and scraping
- * rendered results from the DOM.
+ * Search for items by fetching the search page as an RSC payload.
  *
  * DoorDash search URL: /convenience/store/{storeId}/search/{query}
- * This is a Next.js RSC page — the data comes embedded in the RSC stream,
- * not as a separate JSON response.
  */
 export async function searchItems(
   storeId: string,
@@ -180,209 +99,28 @@ export async function searchItems(
   _limit: number = 10
 ): Promise<{ results: SearchResult[]; debug: string }> {
   try {
-    const page = await browserManager.getPage();
-
-    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 20_000,
+    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/${encodeURIComponent(query)}/`;
+    const result = await browserManager.browserFetchText(searchUrl, {
+      ...RSC_HEADERS,
+      "Next-Url": `/convenience/store/${storeId}/search/${encodeURIComponent(query)}`,
     });
 
-    // Wait for item cards to appear — look for elements with prices
-    try {
-      await page.waitForFunction(
-        () => {
-          const text = document.body.innerText || "";
-          return /\$\d+\.\d{2}/.test(text);
-        },
-        { timeout: 10_000 }
-      );
-      await page.waitForTimeout(1500);
-    } catch {
-      await page.waitForTimeout(3000);
+    const debug = `status=${result.status} | contentType=${result.contentType} | length=${result.text.length} | preview="${result.text.slice(0, 500)}"`;
+
+    if (result.status !== 200 || result.text.length < 50) {
+      return { results: [], debug: `Fetch failed: ${debug}` };
     }
 
-    // Scroll down to trigger lazy loading of more items
-    await page.evaluate(() => {
-      window.scrollTo(0, document.body.scrollHeight);
-    });
-    await page.waitForTimeout(1500);
-    await page.evaluate(() => {
-      window.scrollTo(0, 0);
-    });
+    const parsed = parseRscPayload(result.text);
+    const items = extractSearchResults(parsed, result.text, storeId);
 
-    // Capture debug info about what the page looks like
-    const debugInfo = await page.evaluate(() => {
-      const title = document.title || "(empty title)";
-      const url = window.location.href;
-      const bodyPreview = (document.body.innerText || "").slice(0, 500);
-      const imgCount = document.querySelectorAll("img").length;
-      const anchorCount = document.querySelectorAll("a[href]").length;
-      const priceMatches = (document.body.innerText || "").match(/\$\d+\.\d{2}/g);
-      // Dump all img alt attributes to help debug item names
-      const imgAlts = Array.from(document.querySelectorAll("img[alt]"))
-        .map(img => img.getAttribute("alt"))
-        .filter(alt => alt && alt.length > 2)
-        .slice(0, 15);
-      return {
-        title, url, bodyPreview,
-        imgCount, anchorCount,
-        priceCount: priceMatches?.length ?? 0,
-        imgAlts,
-      };
-    });
-
-    const debug = `title="${debugInfo.title}" | url=${debugInfo.url} | imgs=${debugInfo.imgCount} | anchors=${debugInfo.anchorCount} | prices=${debugInfo.priceCount} | imgAlts=${JSON.stringify(debugInfo.imgAlts)} | body="${debugInfo.bodyPreview.slice(0, 200)}"`;
-
-    const results = await scrapeSearchResults(page, storeId);
-    return { results, debug };
+    return {
+      results: items.slice(0, _limit),
+      debug: `${debug} | items_found=${items.length}`,
+    };
   } catch (error) {
     return { results: [], debug: `Error: ${error}` };
   }
-}
-
-/**
- * Scrape item cards from the rendered DoorDash page.
- *
- * Uses two approaches:
- * 1. Find anchor links to item pages — most reliable
- * 2. Fall back to finding elements with prices + images
- *
- * For item names, prefers img alt attributes over textContent
- * since textContent includes promotional badges, counts, and stock text.
- */
-async function scrapeSearchResults(
-  page: { evaluate: <T>(fn: () => T) => Promise<T> },
-  storeId: string
-): Promise<SearchResult[]> {
-  const items = await page.evaluate(() => {
-    const results: Array<{
-      name: string;
-      price: string;
-      imageUrl: string | null;
-      itemId: string | null;
-    }> = [];
-    const seen = new Set<string>();
-
-    // --- Find item card containers ---
-    let cards: Element[] = [];
-
-    // Strategy 1: Links to item pages (most reliable)
-    const itemLinks = document.querySelectorAll(
-      'a[href*="/item/"], a[href*="/store/"][href*="/item/"]'
-    );
-    if (itemLinks.length > 0) {
-      cards = Array.from(itemLinks);
-    }
-
-    // Strategy 2: data-testid patterns
-    if (cards.length === 0) {
-      for (const sel of [
-        '[data-testid*="MenuItem"]',
-        '[data-testid*="StoreItem"]',
-        '[data-testid*="ItemCard"]',
-      ]) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) { cards = Array.from(els); break; }
-      }
-    }
-
-    // Strategy 3: Anchors with price + image
-    if (cards.length === 0) {
-      cards = Array.from(document.querySelectorAll("a[href]")).filter(el => {
-        const text = el.textContent || "";
-        return /\$\d+\.\d{2}/.test(text) && el.querySelector("img");
-      });
-    }
-
-    // Strategy 4: Leaf divs with price + image (no nested price-cards)
-    if (cards.length === 0) {
-      cards = Array.from(document.querySelectorAll("div, article, li")).filter(el => {
-        const text = el.textContent || "";
-        if (!/\$\d+\.\d{2}/.test(text) || !el.querySelector("img")) return false;
-        return !Array.from(el.querySelectorAll("div, article, li")).some(
-          child => child !== el && /\$\d+\.\d{2}/.test(child.textContent || "") && child.querySelector("img")
-        );
-      });
-    }
-
-    for (const el of cards) {
-      // --- Extract item ID from href ---
-      let itemId: string | null = null;
-      const anchor = el.tagName === "A" ? el : el.querySelector("a[href]");
-      if (anchor) {
-        const href = anchor.getAttribute("href") || "";
-        const idMatch = href.match(/\/item\/(\d+)/);
-        if (idMatch) itemId = idMatch[1];
-      }
-
-      // --- Extract image URL and name from alt ---
-      const imgEl = el.querySelector("img");
-      const imageUrl = imgEl?.getAttribute("src") || null;
-      const imgAlt = imgEl?.getAttribute("alt")?.trim() || null;
-
-      // --- Extract price ---
-      // Look for the price — prefer the last $X.XX which is usually the display price
-      const text = el.textContent || "";
-      const priceMatches = text.match(/\$\d+\.\d{2}/g);
-      if (!priceMatches || priceMatches.length === 0) continue;
-      // Use the last price (display price) — earlier ones may be original/strikethrough prices
-      const price = priceMatches[priceMatches.length - 1];
-
-      // --- Extract name ---
-      let name = "";
-
-      // Best: use img alt (clean item name without promo text)
-      if (imgAlt && imgAlt.length > 3 && !imgAlt.toLowerCase().includes("doordash")) {
-        name = imgAlt;
-      } else {
-        // Fallback: clean up textContent
-        let cleanText = text;
-        for (const p of priceMatches) {
-          cleanText = cleanText.replace(p, "");
-        }
-        cleanText = cleanText
-          .replace(/buy \d+,?\s*save\s+with\s+coupon/gi, "")
-          .replace(/buy \d+,?\s*get \d+\s+free/gi, "")
-          .replace(/save\s+\$\d+(\.\d{2})?/gi, "")
-          .replace(/add to cart/gi, "")
-          .replace(/out of stock/gi, "")
-          .replace(/many in stock/gi, "")
-          .replace(/few left/gi, "")
-          .replace(/limited stock/gi, "")
-          .replace(/\b\d+\s*ct\b/gi, "")
-          .replace(/each/gi, "")
-          .replace(/sponsored/gi, "");
-
-        const lines = cleanText.split(/\n/).map(l => l.trim()).filter(l => l.length > 2);
-        name = lines[0] || "";
-      }
-
-      if (!name || name.length < 2) continue;
-
-      // Deduplicate by name or itemId
-      const dedupeKey = itemId || name;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-
-      results.push({ name, price, imageUrl, itemId });
-    }
-
-    return results;
-  });
-
-  return items.map(
-    (item, i): SearchResult => ({
-      itemId: item.itemId || `scraped-${storeId}-${i}-${Date.now()}`,
-      storeId,
-      name: item.name,
-      description: "",
-      price: parsePrice(item.price),
-      unitPrice: null,
-      imageUrl: item.imageUrl,
-      inStock: true,
-    })
-  );
 }
 
 /**
@@ -394,6 +132,220 @@ export async function findMatchingItem(
   limit: number = 5
 ): Promise<SearchResult[]> {
   const { results } = await searchItems(storeId, itemName, limit);
+  return results;
+}
+
+// ============================================================
+// RSC Payload Parsing
+// ============================================================
+
+/**
+ * Parse a React Server Components text/x-component payload.
+ *
+ * RSC payloads are newline-delimited, with each line in the format:
+ *   INDEX:TYPE_INDICATOR JSON_DATA
+ *
+ * Example lines:
+ *   0:["$","div",null,{"children":...}]
+ *   1:{"name":"Target","id":2834013}
+ *   3:T1234,{raw text of 1234 bytes}
+ *
+ * We extract all JSON objects/arrays from the payload for field searching.
+ */
+function parseRscPayload(text: string): unknown[] {
+  const results: unknown[] = [];
+  const lines = text.split("\n");
+
+  for (const line of lines) {
+    // Match lines like "INDEX:JSON" or "INDEX:[...]" or "INDEX:{...}"
+    const match = line.match(/^[0-9a-f]+:(.+)$/);
+    if (!match) continue;
+
+    const content = match[1].trim();
+    if (!content.startsWith("{") && !content.startsWith("[") && !content.startsWith('"')) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(content);
+      results.push(parsed);
+    } catch {
+      // Not valid JSON — might be a partial or RSC-specific format
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Extract the store name from parsed RSC data.
+ * Looks for common patterns in DoorDash's RSC payload.
+ */
+function extractStoreName(parsed: unknown[], rawText: string): string | null {
+  // Strategy 1: Look for "name" fields in JSON objects that look like store data
+  for (const obj of parsed) {
+    const name = findInObject(obj, (key, value) => {
+      if (typeof value !== "string" || value.length < 2 || value.length > 100) return false;
+      // Look for store-name-like fields
+      if (key === "name" || key === "storeName" || key === "businessName" || key === "displayName") {
+        // Filter out generic values
+        if (value.toLowerCase().includes("doordash") || value.toLowerCase() === "www.doordash.com") return false;
+        return true;
+      }
+      return false;
+    });
+    if (name) return name as string;
+  }
+
+  // Strategy 2: Regex for "name":"StoreName" in raw text
+  const namePatterns = [
+    /"(?:name|storeName|businessName|displayName)"\s*:\s*"([^"]{2,60})"/g,
+  ];
+  for (const pattern of namePatterns) {
+    let match;
+    while ((match = pattern.exec(rawText)) !== null) {
+      const candidate = match[1];
+      if (!candidate.toLowerCase().includes("doordash") &&
+          !candidate.toLowerCase().includes("www.") &&
+          candidate.length > 1) {
+        return candidate;
+      }
+    }
+  }
+
+  // Strategy 3: Look for headerTitle or similar
+  const headerMatch = rawText.match(/"headerTitle"\s*:\s*"([^"]{2,60})"/);
+  if (headerMatch) return headerMatch[1];
+
+  return null;
+}
+
+/**
+ * Extract store details (pickup, fees) from RSC data.
+ */
+function extractStoreDetails(parsed: unknown[], rawText: string): {
+  pickupAvailable: boolean;
+  freeDeliveryThreshold: number | null;
+  deliveryFee: number | null;
+  minServiceFee: number | null;
+} {
+  const details = {
+    pickupAvailable: false,
+    freeDeliveryThreshold: null as number | null,
+    deliveryFee: null as number | null,
+    minServiceFee: null as number | null,
+  };
+
+  // Check for pickup in raw text
+  details.pickupAvailable =
+    rawText.toLowerCase().includes('"pickup"') ||
+    rawText.toLowerCase().includes("pickupavailable") ||
+    rawText.toLowerCase().includes('"isPickupAvailable":true');
+
+  // Look for delivery fee threshold
+  const thresholdMatch = rawText.match(/"freeDeliveryThreshold"[:\s]*(\d+(?:\.\d+)?)/);
+  if (thresholdMatch) details.freeDeliveryThreshold = parseFloat(thresholdMatch[1]);
+
+  const deliveryMatch = rawText.match(/"deliveryFee"[:\s]*(\d+(?:\.\d+)?)/);
+  if (deliveryMatch) details.deliveryFee = parseFloat(deliveryMatch[1]);
+
+  const serviceMatch = rawText.match(/"serviceFee"[:\s]*(\d+(?:\.\d+)?)/);
+  if (serviceMatch) details.minServiceFee = parseFloat(serviceMatch[1]);
+
+  // Also try common patterns
+  if (!details.freeDeliveryThreshold) {
+    const alt = rawText.match(/"minOrderSubtotal"[:\s]*(\d+(?:\.\d+)?)/);
+    if (alt) details.freeDeliveryThreshold = parseFloat(alt[1]) / 100; // cents to dollars
+  }
+
+  return details;
+}
+
+/**
+ * Extract search results from parsed RSC data.
+ */
+function extractSearchResults(parsed: unknown[], rawText: string, storeId: string): SearchResult[] {
+  const results: SearchResult[] = [];
+  const seen = new Set<string>();
+
+  // Strategy 1: Find item-like objects in parsed data
+  for (const obj of parsed) {
+    findAllItems(obj, (item: Record<string, unknown>) => {
+      const name = (item.name || item.displayName || item.itemName || item.title) as string | undefined;
+      const price = (item.price || item.displayPrice || item.unitPrice) as number | string | undefined;
+      const id = (item.id || item.itemId || item.menuItemId) as string | number | undefined;
+      const imageUrl = (item.imageUrl || item.imgUrl || item.heroImageUrl || item.thumbnailUrl) as string | undefined;
+      const description = (item.description || item.itemDescription) as string | undefined;
+
+      if (!name || typeof name !== "string" || name.length < 2) return;
+      if (price === undefined || price === null) return;
+
+      const itemId = id ? String(id) : null;
+      const dedupeKey = itemId || name;
+      if (seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
+
+      results.push({
+        itemId: itemId || `rsc-${storeId}-${results.length}-${Date.now()}`,
+        storeId,
+        name,
+        description: typeof description === "string" ? description : "",
+        price: parsePrice(price),
+        unitPrice: null,
+        imageUrl: typeof imageUrl === "string" ? imageUrl : null,
+        inStock: true,
+      });
+    });
+  }
+
+  // Strategy 2: If no structured items found, try regex on raw text
+  if (results.length === 0) {
+    // Look for item patterns in raw RSC text
+    // Pattern: "name":"Item Name"..."price":XXXX or "displayPrice":"$X.XX"
+    const itemRegex = /"(?:name|displayName|itemName)"\s*:\s*"([^"]{3,120})"/g;
+    const priceRegex = /"(?:price|displayPrice|unitPrice)"\s*:\s*(?:"?\$?(\d+(?:\.\d+)?)"?|(\d+))/g;
+
+    const names: string[] = [];
+    const prices: number[] = [];
+
+    let match;
+    while ((match = itemRegex.exec(rawText)) !== null) {
+      const name = match[1];
+      // Filter out non-item names
+      if (name.toLowerCase().includes("doordash") ||
+          name.length < 3 ||
+          name.startsWith("http") ||
+          name.includes("\\u")) continue;
+      names.push(name);
+    }
+
+    while ((match = priceRegex.exec(rawText)) !== null) {
+      const val = match[1] || match[2];
+      if (val) prices.push(parseFloat(val));
+    }
+
+    // Pair names with prices (best effort)
+    for (let i = 0; i < names.length && i < prices.length; i++) {
+      if (seen.has(names[i])) continue;
+      seen.add(names[i]);
+
+      let price = prices[i];
+      // DoorDash often stores prices in cents
+      if (price > 100) price = price / 100;
+
+      results.push({
+        itemId: `regex-${storeId}-${i}-${Date.now()}`,
+        storeId,
+        name: names[i],
+        description: "",
+        price,
+        unitPrice: null,
+        imageUrl: null,
+        inStock: true,
+      });
+    }
+  }
+
   return results;
 }
 
@@ -431,7 +383,6 @@ export async function captureNetworkRequests(
     text: () => Promise<string>;
   }) => {
     const url = response.url();
-    // Only capture interesting requests (not static assets)
     if (
       url.includes("graphql") ||
       url.includes("/search") ||
@@ -468,10 +419,73 @@ export async function captureNetworkRequests(
 
 function parsePrice(price: unknown): number {
   if (price === undefined || price === null) return 0;
-  if (typeof price === "number") return price;
+  if (typeof price === "number") {
+    // DoorDash sometimes stores prices in cents
+    return price > 100 ? price / 100 : price;
+  }
   if (typeof price === "string") {
     const cleaned = price.replace(/[$,]/g, "").trim();
-    return parseFloat(cleaned) || 0;
+    const val = parseFloat(cleaned) || 0;
+    return val > 100 ? val / 100 : val;
   }
   return 0;
+}
+
+/**
+ * Find a value in a nested object/array by key predicate.
+ * Returns the first matching value.
+ */
+function findInObject(
+  obj: unknown,
+  predicate: (key: string, value: unknown) => boolean,
+  depth: number = 0
+): unknown | null {
+  if (depth > 15) return null;
+  if (obj === null || obj === undefined) return null;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const result = findInObject(item, predicate, depth + 1);
+      if (result !== null) return result;
+    }
+  } else if (typeof obj === "object") {
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (predicate(key, value)) return value;
+      const result = findInObject(value, predicate, depth + 1);
+      if (result !== null) return result;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Find all item-like objects in a nested structure.
+ * An "item" is an object with at least a name and price field.
+ */
+function findAllItems(
+  obj: unknown,
+  callback: (item: Record<string, unknown>) => void,
+  depth: number = 0
+): void {
+  if (depth > 15) return;
+  if (obj === null || obj === undefined) return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      findAllItems(item, callback, depth + 1);
+    }
+  } else if (typeof obj === "object") {
+    const record = obj as Record<string, unknown>;
+    // Check if this object looks like an item
+    const hasName = "name" in record || "displayName" in record || "itemName" in record || "title" in record;
+    const hasPrice = "price" in record || "displayPrice" in record || "unitPrice" in record;
+    if (hasName && hasPrice) {
+      callback(record);
+    }
+    // Recurse into children
+    for (const value of Object.values(record)) {
+      findAllItems(value, callback, depth + 1);
+    }
+  }
 }
