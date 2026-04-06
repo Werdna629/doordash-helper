@@ -64,43 +64,60 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
 
     // Navigate to the store page
     await page.goto(storeUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 20_000,
+      waitUntil: "networkidle",
+      timeout: 25_000,
     });
 
-    // Wait for the page to load and make its API calls
-    await page.waitForTimeout(5000);
+    // Wait a bit more for dynamic rendering
+    await page.waitForTimeout(3000);
 
     page.off("response", responseHandler);
 
-    // Try to extract store name from the page
+    // Extract store name from the page — try multiple strategies
     const pageData = await page.evaluate(() => {
       const getName = () => {
-        // Try various selectors for store name
+        // Strategy 1: Page title usually has "StoreName - DoorDash" or "StoreName | DoorDash"
+        const title = document.title || "";
+        const titleParts = title.split(/[|\-–—]/);
+        if (titleParts.length >= 2) {
+          const candidate = titleParts[0].trim();
+          // Filter out generic DoorDash titles
+          if (candidate && !candidate.toLowerCase().includes("doordash") && candidate.length > 1) {
+            return candidate;
+          }
+        }
+
+        // Strategy 2: h1 tag
         const h1 = document.querySelector("h1");
         if (h1?.textContent?.trim()) return h1.textContent.trim();
 
-        const title = document.title;
-        if (title && !title.includes("DoorDash")) return title.split("|")[0]?.trim() || title;
-        if (title) {
-          const parts = title.split("|");
-          if (parts.length > 1) return parts[0].trim();
+        // Strategy 3: og:title meta tag
+        const ogTitle = document.querySelector('meta[property="og:title"]');
+        if (ogTitle) {
+          const content = ogTitle.getAttribute("content") || "";
+          const parts = content.split(/[|\-–—]/);
+          if (parts[0]?.trim()) return parts[0].trim();
+        }
+
+        // Strategy 4: Look for a prominent store name element
+        const candidates = document.querySelectorAll(
+          '[data-testid*="store-name"], [data-testid*="StoreName"], [class*="StoreName"], [class*="storeName"]'
+        );
+        for (const el of candidates) {
+          if (el.textContent?.trim()) return el.textContent.trim();
         }
 
         return null;
       };
 
-      // Look for delivery/fee info in the page text
       const bodyText = document.body.innerText || "";
 
-      // Check for pickup option
       const hasPickup =
         bodyText.toLowerCase().includes("pickup") &&
         (bodyText.toLowerCase().includes("pickup available") ||
          bodyText.toLowerCase().includes("switch to pickup") ||
-         !!document.querySelector('[data-testid*="pickup"], [aria-label*="ickup"]'));
+         !!document.querySelector('[data-testid*="pickup"], [data-testid*="Pickup"], [aria-label*="ickup"]'));
 
-      // Try to find delivery fee info from page text
       const freeDeliveryMatch = bodyText.match(
         /free delivery (?:on orders |over |for orders over )?\$(\d+(?:\.\d{2})?)/i
       );
@@ -117,7 +134,6 @@ export async function getStoreInfo(storeId: string, storeUrl: string): Promise<S
         freeDeliveryThreshold: freeDeliveryMatch ? parseFloat(freeDeliveryMatch[1]) : null,
         deliveryFee: deliveryFeeMatch ? parseFloat(deliveryFeeMatch[1]) : null,
         serviceFee: serviceFeeMatch ? parseFloat(serviceFeeMatch[1]) : null,
-        url: window.location.href,
       };
     });
 
@@ -211,8 +227,12 @@ function deepExtractFees(obj: unknown, info: Partial<Store>): void {
 // ============================================================
 
 /**
- * Search for items by navigating to the store's search page on DoorDash
- * and intercepting the GraphQL responses.
+ * Search for items by navigating to the store's search page on DoorDash.
+ *
+ * DoorDash's search URL pattern: /convenience/store/{storeId}/search/{query}
+ * The page loads and makes its own API calls. We intercept all responses
+ * (both GraphQL and regular JSON) to capture results, plus scrape the DOM
+ * as a fallback.
  */
 export async function searchItems(
   storeId: string,
@@ -224,12 +244,13 @@ export async function searchItems(
 
     const searchResults: SearchResult[] = [];
 
-    // Intercept GraphQL responses that contain search results
-    const responseHandler = async (response: { url: () => string; request: () => { method: () => string }; json: () => Promise<unknown> }) => {
-      if (
-        response.url().includes("graphql") &&
-        response.request().method() === "POST"
-      ) {
+    // Intercept ALL responses that might contain search results
+    const responseHandler = async (response: { url: () => string; request: () => { method: () => string }; json: () => Promise<unknown>; text: () => Promise<string> }) => {
+      const url = response.url();
+      const isGraphQL = url.includes("graphql") && response.request().method() === "POST";
+      const isSearchAPI = url.includes("/search") && url.includes(storeId);
+
+      if (isGraphQL || isSearchAPI) {
         try {
           const json = (await response.json()) as Record<string, unknown>;
           const items = extractSearchResultsFromGraphQL(json, storeId);
@@ -242,19 +263,19 @@ export async function searchItems(
 
     page.on("response", responseHandler);
 
-    // Navigate to the store's search URL
-    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/?searchTerm=${encodeURIComponent(query)}`;
+    // Navigate to the store's search page using the correct URL pattern
+    const searchUrl = `https://www.doordash.com/convenience/store/${storeId}/search/${encodeURIComponent(query)}`;
     await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 20_000,
+      waitUntil: "networkidle",
+      timeout: 25_000,
     });
 
-    // Wait for search results to load
-    await page.waitForTimeout(4000);
+    // Wait for search results to render
+    await page.waitForTimeout(3000);
 
     page.off("response", responseHandler);
 
-    // If we got results from GraphQL interception, use those
+    // If we got results from response interception, use those
     if (searchResults.length > 0) {
       return searchResults;
     }
@@ -346,33 +367,67 @@ async function scrapeSearchResults(
 ): Promise<SearchResult[]> {
   const items = await page.evaluate(() => {
     const results: Array<{ name: string; price: string; imageUrl: string | null }> = [];
+    const seen = new Set<string>();
 
-    // Look for item cards — DoorDash typically renders items in cards/tiles
-    const candidates = document.querySelectorAll(
-      '[data-testid*="item"], [data-testid*="product"], [class*="ItemCard"], [class*="ProductCard"], a[href*="/item/"]'
-    );
+    // DoorDash renders items as clickable cards/links, often inside anchors
+    // Try multiple selectors to find them
+    const selectors = [
+      '[data-testid*="MenuItem"]',
+      '[data-testid*="item"]',
+      '[data-testid*="product"]',
+      '[data-testid*="Product"]',
+      'a[href*="/store/"][href*="/item/"]',
+      'a[href*="/convenience/"][href*="/item/"]',
+      '[class*="ItemCard"]',
+      '[class*="ProductCard"]',
+      '[class*="menuItem"]',
+    ];
 
-    candidates.forEach((el) => {
-      // Find name — usually in a span or div with specific styling
-      const nameEl =
-        el.querySelector("span[class*='Name'], div[class*='Name']") ||
-        el.querySelector("span:not(:empty)");
-      const name = nameEl?.textContent?.trim();
+    let candidates: Element[] = [];
+    for (const sel of selectors) {
+      const els = document.querySelectorAll(sel);
+      if (els.length > 0) {
+        candidates = Array.from(els);
+        break;
+      }
+    }
 
-      // Find price
-      const priceEl =
-        el.querySelector("span[class*='Price'], div[class*='Price']") ||
-        el.querySelector("span[class*='price']");
-      const price = priceEl?.textContent?.trim();
+    // If no specific selectors match, try a broader approach:
+    // find all elements that contain both a price-like string and an img
+    if (candidates.length === 0) {
+      const allLinks = document.querySelectorAll("a[href]");
+      candidates = Array.from(allLinks).filter((el) => {
+        const text = el.textContent || "";
+        return text.includes("$") && el.querySelector("img");
+      });
+    }
+
+    for (const el of candidates) {
+      const text = el.textContent || "";
+
+      // Extract price (look for $X.XX pattern)
+      const priceMatch = text.match(/\$(\d+\.\d{2})/);
+      if (!priceMatch) continue;
+      const price = priceMatch[0];
+
+      // Extract name: get text content but exclude the price portion
+      // Usually the name is the most prominent text before the price
+      const allText = text.replace(/\$\d+\.\d{2}/g, "").trim();
+      // Split by newlines and take the first non-empty line as the name
+      const lines = allText.split(/\n/).map((l) => l.trim()).filter(Boolean);
+      const name = lines[0];
+      if (!name || name.length < 2) continue;
+
+      // Deduplicate
+      if (seen.has(name)) continue;
+      seen.add(name);
 
       // Find image
       const imgEl = el.querySelector("img");
-      const imageUrl = imgEl?.src || null;
+      const imageUrl = imgEl?.getAttribute("src") || null;
 
-      if (name && price) {
-        results.push({ name, price, imageUrl });
-      }
-    });
+      results.push({ name, price, imageUrl });
+    }
 
     return results;
   });
