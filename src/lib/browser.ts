@@ -113,63 +113,57 @@ class BrowserManager {
 
   /**
    * Check if the current session is authenticated.
-   * Uses the Playwright context cookie API (not document.cookie) so we can
-   * see HttpOnly cookies like session tokens.
+   * Navigates to DoorDash and checks whether we land on a logged-in page
+   * or get redirected to login.
    */
   async checkAuth(): Promise<{ loggedIn: boolean; userName: string | null; cookieInfo?: string }> {
     try {
       const context = await this.getContext();
-
-      // Check cookies via Playwright API — this sees HttpOnly cookies too
-      const cookies = await context.cookies("https://www.doordash.com");
-      const sessionCookieNames = ["ddsid", "credential_token", "dd_session"];
-      const foundSession = cookies.filter((c) =>
-        sessionCookieNames.includes(c.name)
-      );
-
-      if (foundSession.length > 0) {
-        return {
-          loggedIn: true,
-          userName: null,
-          cookieInfo: `Found session cookies: ${foundSession.map((c) => c.name).join(", ")}`,
-        };
-      }
-
-      // Fallback: navigate and check if DoorDash redirects us or shows logged-in UI
       const page = await this.getPage();
-      const response = await page.goto("https://www.doordash.com/home/", {
+
+      // List all cookies we have for DoorDash (for debugging)
+      const cookies = await context.cookies("https://www.doordash.com");
+      const cookieNames = cookies.map((c) => c.name);
+
+      // Navigate to an account page — if we're logged in we'll see it,
+      // if not we'll get redirected to login
+      const response = await page.goto("https://www.doordash.com/consumer/account/", {
         waitUntil: "domcontentloaded",
-        timeout: 15_000,
+        timeout: 20_000,
       });
 
-      if (!response || response.status() >= 400) {
-        return { loggedIn: false, userName: null };
-      }
+      // Wait a moment for any redirects to settle
+      await page.waitForTimeout(2000);
 
-      // Re-check cookies after navigation (DoorDash may set them on page load)
-      const postNavCookies = await context.cookies("https://www.doordash.com");
-      const postNavSession = postNavCookies.filter((c) =>
-        sessionCookieNames.includes(c.name)
-      );
+      const finalUrl = page.url();
 
-      if (postNavSession.length > 0) {
-        return {
-          loggedIn: true,
-          userName: null,
-          cookieInfo: `Found session cookies after navigation: ${postNavSession.map((c) => c.name).join(", ")}`,
-        };
-      }
-
-      // Check if the page URL indicates we're logged in (not redirected to login)
-      const currentUrl = page.url();
       const isOnLoginPage =
-        currentUrl.includes("/consumer/login") ||
-        currentUrl.includes("/identity/login");
+        finalUrl.includes("/consumer/login") ||
+        finalUrl.includes("/identity/login") ||
+        finalUrl.includes("/consumer/auth");
+
+      // Try to grab the user's name from the account page if logged in
+      let userName: string | null = null;
+      if (!isOnLoginPage) {
+        try {
+          userName = await page.evaluate(() => {
+            // Look for common patterns where DoorDash shows the user name
+            const el = document.querySelector('[data-testid="AccountName"]') ||
+                       document.querySelector('h1') ||
+                       document.querySelector('[class*="AccountName"]');
+            return el?.textContent?.trim() || null;
+          });
+        } catch {
+          // ignore
+        }
+      }
+
+      const statusCode = response?.status() ?? 0;
 
       return {
-        loggedIn: !isOnLoginPage,
-        userName: null,
-        cookieInfo: `${postNavCookies.length} total cookies, no known session cookies found. URL: ${currentUrl}`,
+        loggedIn: !isOnLoginPage && statusCode < 400,
+        userName,
+        cookieInfo: `${cookies.length} cookies (${cookieNames.slice(0, 8).join(", ")}${cookies.length > 8 ? "..." : ""}). Final URL: ${finalUrl}`,
       };
     } catch (err) {
       return { loggedIn: false, userName: null, cookieInfo: `Error: ${err}` };
