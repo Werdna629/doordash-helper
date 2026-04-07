@@ -1,6 +1,10 @@
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 const CONFIG_DIR = path.join(os.homedir(), ".config", "doordash-helper");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
@@ -8,22 +12,26 @@ const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 interface StoredSession {
   cookies: string;
   userAgent: string;
-  headers: Record<string, string>;
+  /** All -H headers extracted from the cURL command (original casing) */
+  allHeaders: Array<[string, string]>;
   savedAt: string;
 }
 
 /**
  * Session manager for DoorDash.
  *
- * Instead of using a headless browser (which Cloudflare blocks), we store
- * cookies and headers from the user's real browser (via cURL paste) and
- * replay them in direct Node.js fetch requests.
+ * Cloudflare's cf_clearance cookie is bound to the browser's TLS fingerprint
+ * (JA3/JA4). Neither Node.js fetch nor a headless browser can replay it.
+ *
+ * Solution: shell out to the `curl` CLI with the exact same headers that
+ * the user's real browser sent. This preserves the correct TLS behavior
+ * and lets Cloudflare's challenge token pass through.
  */
 class SessionManager {
   private cookies: string = "";
-  private userAgent: string =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-  private extraHeaders: Record<string, string> = {};
+  private userAgent: string = "";
+  /** All headers from the original cURL (preserving original case) */
+  private allHeaders: Array<[string, string]> = [];
 
   constructor() {
     this.loadSession();
@@ -31,37 +39,39 @@ class SessionManager {
 
   /**
    * Import session from a cURL command or cookie string.
-   * Extracts cookies, user-agent, and other relevant headers.
+   * Stores ALL headers from the cURL to replay them exactly.
    */
   importFromCurl(raw: string): { success: boolean; cookieCount: number; error?: string } {
     const trimmed = raw.trim();
 
     let cookieStr = "";
-    let userAgent = this.userAgent;
-    const headers: Record<string, string> = {};
+    let userAgent = "";
+    const allHeaders: Array<[string, string]> = [];
 
     if (trimmed.startsWith("curl ") || trimmed.includes("curl '") || trimmed.includes('curl "')) {
-      // Extract cookies
-      const cookieMatch = trimmed.match(/-H\s+['"][Cc]ookie:\s*([^'"]+)['"]/);
-      const cookieMatchB = trimmed.match(/(?:-b|--cookie)\s+['"]([^'"]+)['"]/);
-      cookieStr = cookieMatch?.[1] || cookieMatchB?.[1] || "";
-
-      // Extract user-agent
-      const uaMatch = trimmed.match(/-H\s+['"][Uu]ser-[Aa]gent:\s*([^'"]+)['"]/);
-      if (uaMatch) userAgent = uaMatch[1];
-
-      // Extract other useful headers
-      const headerRegex = /-H\s+['"]([^:'"]+):\s*([^'"]+)['"]/g;
+      // Extract all -H headers (preserve original casing)
+      const headerRegex = /-H\s+['"]([^'"]+)['"]/g;
       let m;
       while ((m = headerRegex.exec(trimmed)) !== null) {
-        const key = m[1].toLowerCase();
-        const value = m[2];
-        // Keep headers that might be useful, skip cookie/UA (handled above)
-        if (key !== "cookie" && key !== "user-agent" &&
-            !key.startsWith("sec-") && key !== "accept-language" &&
-            key !== "accept-encoding") {
-          headers[m[1]] = value;
+        const headerLine = m[1];
+        const colonIdx = headerLine.indexOf(":");
+        if (colonIdx === -1) continue;
+        const name = headerLine.slice(0, colonIdx).trim();
+        const value = headerLine.slice(colonIdx + 1).trim();
+
+        if (name.toLowerCase() === "cookie") {
+          cookieStr = value;
+        } else if (name.toLowerCase() === "user-agent") {
+          userAgent = value;
         }
+
+        allHeaders.push([name, value]);
+      }
+
+      // Also check for -b / --cookie flags
+      if (!cookieStr) {
+        const bMatch = trimmed.match(/(?:-b|--cookie)\s+['"]([^'"]+)['"]/);
+        if (bMatch) cookieStr = bMatch[1];
       }
     } else if (trimmed.startsWith("[")) {
       // JSON cookie array
@@ -77,21 +87,21 @@ class SessionManager {
     }
 
     if (!cookieStr) {
-      return { success: false, cookieCount: 0, error: "No cookies found in input" };
+      return { success: false, cookieCount: 0, error: "No cookies found in input. Make sure to copy as cURL from Chrome DevTools." };
     }
 
     const cookieCount = cookieStr.split(";").filter(s => s.trim().includes("=")).length;
 
     this.cookies = cookieStr;
     this.userAgent = userAgent;
-    this.extraHeaders = headers;
+    this.allHeaders = allHeaders;
     this.saveSession();
 
     return { success: true, cookieCount };
   }
 
   /**
-   * Check if we have a valid session by fetching a DoorDash page.
+   * Check if we have a valid session by curling a DoorDash page.
    */
   async checkAuth(): Promise<{ loggedIn: boolean; userName: string | null; cookieInfo?: string }> {
     if (!this.cookies) {
@@ -99,46 +109,41 @@ class SessionManager {
     }
 
     try {
-      const resp = await this.fetch("https://www.doordash.com/consumer/account/", {
-        redirect: "manual", // Don't follow redirects — we want to check the Location
-      });
+      const result = await this.curlFetch("https://www.doordash.com/consumer/account/");
 
-      // If we get a redirect to login, we're not logged in
-      const location = resp.headers.get("location") || "";
-      if (resp.status >= 300 && resp.status < 400) {
+      const cookieCount = this.cookies.split(";").filter(s => s.includes("=")).length;
+      const hasCfClearance = this.cookies.includes("cf_clearance");
+
+      // Check for Cloudflare challenge
+      if (result.status === 403 && (result.body.includes("Just a moment") || result.body.includes("security verification"))) {
+        return {
+          loggedIn: false,
+          userName: null,
+          cookieInfo: `Cloudflare challenge (403). ${cookieCount} cookies${hasCfClearance ? " (has cf_clearance)" : " (NO cf_clearance!)"}. Try pasting a fresh cURL.`,
+        };
+      }
+
+      // Check for redirect to login
+      if (result.redirectUrl) {
         const isLoginRedirect =
-          location.includes("/consumer/login") ||
-          location.includes("/identity/login") ||
-          location.includes("/consumer/auth");
+          result.redirectUrl.includes("/consumer/login") ||
+          result.redirectUrl.includes("/identity/login") ||
+          result.redirectUrl.includes("/consumer/auth");
 
         if (isLoginRedirect) {
           return {
             loggedIn: false,
             userName: null,
-            cookieInfo: `Redirected to login (${resp.status}). Cookies may be expired — paste a fresh cURL.`,
+            cookieInfo: `Redirected to login. Cookies may be expired — paste a fresh cURL.`,
           };
         }
       }
 
-      // Check if we got a Cloudflare challenge
-      if (resp.status === 403) {
-        const text = await resp.text();
-        if (text.includes("Just a moment") || text.includes("security verification")) {
-          return {
-            loggedIn: false,
-            userName: null,
-            cookieInfo: "Cloudflare challenge on auth check (403). Try pasting a fresh cURL — make sure it includes cf_clearance cookie.",
-          };
-        }
-      }
-
-      // 200 or other success — we're logged in
-      const cookieCount = this.cookies.split(";").filter(s => s.includes("=")).length;
-      const hasCfClearance = this.cookies.includes("cf_clearance");
+      // Success
       return {
-        loggedIn: resp.status === 200,
+        loggedIn: result.status === 200 || (result.status >= 300 && result.status < 400 && !result.redirectUrl?.includes("login")),
         userName: null,
-        cookieInfo: `${cookieCount} cookies${hasCfClearance ? " (has cf_clearance)" : " (no cf_clearance!)"}, status=${resp.status}`,
+        cookieInfo: `${cookieCount} cookies${hasCfClearance ? " (has cf_clearance)" : ""}, status=${result.status}`,
       };
     } catch (err) {
       return { loggedIn: false, userName: null, cookieInfo: `Error: ${err}` };
@@ -146,40 +151,95 @@ class SessionManager {
   }
 
   /**
-   * Make a fetch request with stored session cookies and headers.
+   * Fetch a URL using the curl CLI with the stored session headers.
+   * This preserves the TLS fingerprint behavior that Cloudflare expects.
    */
-  async fetch(url: string, options: RequestInit = {}): Promise<Response> {
-    const headers: Record<string, string> = {
-      "User-Agent": this.userAgent,
-      Cookie: this.cookies,
-      ...this.extraHeaders,
-      ...(options.headers as Record<string, string> || {}),
-    };
+  async curlFetch(
+    url: string,
+    extraHeaders: Record<string, string> = {}
+  ): Promise<{ body: string; status: number; contentType: string; redirectUrl: string | null }> {
+    const args = this.buildCurlArgs(url, extraHeaders);
 
-    return globalThis.fetch(url, {
-      ...options,
-      headers,
-    });
+    try {
+      const { stdout, stderr } = await execFileAsync("curl", args, {
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        timeout: 30_000,
+      });
+
+      // Parse the status code and headers from stderr (curl -w output)
+      // We use -w to append status info
+      const statusMatch = stderr.match(/HTTP\/[\d.]+\s+(\d+)/);
+      const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+
+      // Parse redirect location from stderr
+      const locationMatch = stderr.match(/[Ll]ocation:\s*(\S+)/);
+      const redirectUrl = locationMatch ? locationMatch[1] : null;
+
+      // Content-type from stderr
+      const ctMatch = stderr.match(/[Cc]ontent-[Tt]ype:\s*([^\r\n]+)/);
+      const contentType = ctMatch ? ctMatch[1].trim() : "unknown";
+
+      return { body: stdout, status, contentType, redirectUrl };
+    } catch (error: unknown) {
+      const err = error as { stdout?: string; stderr?: string; message?: string };
+      // curl might exit non-zero but still have useful output
+      if (err.stdout) {
+        const statusMatch = err.stderr?.match(/HTTP\/[\d.]+\s+(\d+)/);
+        const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+        return { body: err.stdout, status, contentType: "unknown", redirectUrl: null };
+      }
+      throw new Error(`curl failed: ${err.message || error}`);
+    }
   }
 
   /**
-   * Convenience: fetch a URL and return the text body + metadata.
+   * Convenience: fetch a URL and return text + metadata (used by doordash-api).
    */
   async fetchText(
     url: string,
     extraHeaders: Record<string, string> = {}
   ): Promise<{ text: string; status: number; contentType: string }> {
-    const resp = await this.fetch(url, { headers: extraHeaders });
-    const text = await resp.text();
-    return {
-      text,
-      status: resp.status,
-      contentType: resp.headers.get("content-type") || "unknown",
-    };
+    const result = await this.curlFetch(url, extraHeaders);
+    return { text: result.body, status: result.status, contentType: result.contentType };
   }
 
   get hasCookies(): boolean {
     return this.cookies.length > 0;
+  }
+
+  // -- Private --
+
+  /**
+   * Build curl command args that replay the user's original browser headers.
+   */
+  private buildCurlArgs(url: string, extraHeaders: Record<string, string> = {}): string[] {
+    const args: string[] = [
+      "-s",           // silent (no progress)
+      "-S",           // show errors
+      "-v",           // verbose (headers to stderr for parsing)
+      "-L",           // follow redirects
+      "--max-redirs", "3",
+      "--max-time", "25",
+      "-o", "-",      // output body to stdout
+    ];
+
+    // Replay ALL original headers from the cURL (except cookie, which we handle separately)
+    for (const [name, value] of this.allHeaders) {
+      if (name.toLowerCase() === "cookie") continue; // handled below
+      args.push("-H", `${name}: ${value}`);
+    }
+
+    // Add any extra headers (like RSC headers)
+    for (const [name, value] of Object.entries(extraHeaders)) {
+      args.push("-H", `${name}: ${value}`);
+    }
+
+    // Always send cookies
+    args.push("-H", `cookie: ${this.cookies}`);
+
+    args.push(url);
+
+    return args;
   }
 
   // -- Persistence --
@@ -190,7 +250,7 @@ class SessionManager {
       const data: StoredSession = {
         cookies: this.cookies,
         userAgent: this.userAgent,
-        headers: this.extraHeaders,
+        allHeaders: this.allHeaders,
         savedAt: new Date().toISOString(),
       };
       fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
@@ -205,7 +265,7 @@ class SessionManager {
         const data = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8")) as StoredSession;
         this.cookies = data.cookies || "";
         this.userAgent = data.userAgent || this.userAgent;
-        this.extraHeaders = data.headers || {};
+        this.allHeaders = data.allHeaders || [];
       }
     } catch {
       // ignore
