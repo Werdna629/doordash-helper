@@ -9,6 +9,26 @@ const execFileAsync = promisify(execFile);
 const CONFIG_DIR = path.join(os.homedir(), ".config", "doordash-helper");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 
+// Path to curl-impersonate-chrome binary (downloaded by scripts/setup.sh)
+const CURL_IMPERSONATE_PATH = path.join(
+  process.cwd(),
+  "bin",
+  "curl-impersonate-chrome"
+);
+
+// Chrome TLS flags for curl-impersonate
+const CHROME_TLS_FLAGS = [
+  "--ciphers",
+  "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,ECDHE-ECDSA-AES128-GCM-SHA256,ECDHE-RSA-AES128-GCM-SHA256,ECDHE-ECDSA-AES256-GCM-SHA384,ECDHE-RSA-AES256-GCM-SHA384,ECDHE-ECDSA-CHACHA20-POLY1305,ECDHE-RSA-CHACHA20-POLY1305,ECDHE-RSA-AES128-SHA,ECDHE-RSA-AES256-SHA,AES128-GCM-SHA256,AES256-GCM-SHA384,AES128-SHA,AES256-SHA",
+  "--http2",
+  "--http2-no-server-push",
+  "--compressed",
+  "--tlsv1.2",
+  "--alps",
+  "--tls-permute-extensions",
+  "--cert-compression", "brotli",
+];
+
 interface StoredSession {
   cookies: string;
   userAgent: string;
@@ -114,12 +134,17 @@ class SessionManager {
       const cookieCount = this.cookies.split(";").filter(s => s.includes("=")).length;
       const hasCfClearance = this.cookies.includes("cf_clearance");
 
+      const usingImpersonate = fs.existsSync(CURL_IMPERSONATE_PATH);
+
       // Check for Cloudflare challenge
       if (result.status === 403 && (result.body.includes("Just a moment") || result.body.includes("security verification"))) {
+        const hint = usingImpersonate
+          ? "cf_clearance may be expired — paste a fresh cURL."
+          : "Run 'bash scripts/setup.sh' to install curl-impersonate (needed to bypass Cloudflare TLS check).";
         return {
           loggedIn: false,
           userName: null,
-          cookieInfo: `Cloudflare challenge (403). ${cookieCount} cookies${hasCfClearance ? " (has cf_clearance)" : " (NO cf_clearance!)"}. Try pasting a fresh cURL.`,
+          cookieInfo: `Cloudflare challenge (403). ${cookieCount} cookies${hasCfClearance ? " (has cf_clearance)" : " (NO cf_clearance!)"}. ${hint}`,
         };
       }
 
@@ -151,17 +176,21 @@ class SessionManager {
   }
 
   /**
-   * Fetch a URL using the curl CLI with the stored session headers.
-   * This preserves the TLS fingerprint behavior that Cloudflare expects.
+   * Fetch a URL using curl-impersonate-chrome with the stored session headers.
+   * curl-impersonate mimics Chrome's TLS fingerprint (JA3/JA4), which lets
+   * Cloudflare's cf_clearance cookie pass validation.
+   *
+   * Falls back to regular curl if curl-impersonate is not installed.
    */
   async curlFetch(
     url: string,
     extraHeaders: Record<string, string> = {}
   ): Promise<{ body: string; status: number; contentType: string; redirectUrl: string | null }> {
-    const args = this.buildCurlArgs(url, extraHeaders);
+    const curlBin = this.getCurlBinary();
+    const args = this.buildCurlArgs(url, extraHeaders, curlBin === CURL_IMPERSONATE_PATH);
 
     try {
-      const { stdout, stderr } = await execFileAsync("curl", args, {
+      const { stdout, stderr } = await execFileAsync(curlBin, args, {
         maxBuffer: 10 * 1024 * 1024, // 10MB
         timeout: 30_000,
       });
@@ -188,6 +217,12 @@ class SessionManager {
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
         return { body: err.stdout, status, contentType: "unknown", redirectUrl: null };
       }
+      // Check if curl-impersonate is missing
+      if (err.message?.includes("ENOENT")) {
+        throw new Error(
+          `curl-impersonate-chrome not found. Run: bash scripts/setup.sh`
+        );
+      }
       throw new Error(`curl failed: ${err.message || error}`);
     }
   }
@@ -210,9 +245,24 @@ class SessionManager {
   // -- Private --
 
   /**
+   * Find the best available curl binary.
+   * Prefers curl-impersonate-chrome (mimics Chrome TLS) over regular curl.
+   */
+  private getCurlBinary(): string {
+    if (fs.existsSync(CURL_IMPERSONATE_PATH)) {
+      return CURL_IMPERSONATE_PATH;
+    }
+    return "curl"; // fallback
+  }
+
+  /**
    * Build curl command args that replay the user's original browser headers.
    */
-  private buildCurlArgs(url: string, extraHeaders: Record<string, string> = {}): string[] {
+  private buildCurlArgs(
+    url: string,
+    extraHeaders: Record<string, string> = {},
+    isImpersonate: boolean = false
+  ): string[] {
     const args: string[] = [
       "-s",           // silent (no progress)
       "-S",           // show errors
@@ -222,6 +272,11 @@ class SessionManager {
       "--max-time", "25",
       "-o", "-",      // output body to stdout
     ];
+
+    // Add Chrome TLS flags when using curl-impersonate
+    if (isImpersonate) {
+      args.push(...CHROME_TLS_FLAGS);
+    }
 
     // Replay ALL original headers from the cURL (except cookie, which we handle separately)
     for (const [name, value] of this.allHeaders) {

@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# curl-impersonate binary (downloaded by scripts/setup.sh)
+/bin/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
