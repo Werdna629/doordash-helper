@@ -53,14 +53,8 @@ if [ "$OS" = "Linux" ]; then
     exit 1
   fi
 elif [ "$OS" = "Darwin" ]; then
-  if [ "$ARCH" = "x86_64" ]; then
-    URL="https://github.com/lwthiker/curl-impersonate/releases/download/${VERSION}/curl-impersonate-${VERSION}.x86_64-macos.tar.gz"
-  elif [ "$ARCH" = "arm64" ]; then
-    URL="https://github.com/lwthiker/curl-impersonate/releases/download/${VERSION}/curl-impersonate-${VERSION}.arm64-macos.tar.gz"
-  else
-    echo "Error: Unsupported architecture '$ARCH' on macOS."
-    exit 1
-  fi
+  # No arm64 macOS build exists — use x86_64 via Rosetta 2
+  URL="https://github.com/lwthiker/curl-impersonate/releases/download/${VERSION}/curl-impersonate-${VERSION}.x86_64-macos.tar.gz"
 fi
 
 if [ -f "$BIN_DIR/curl-impersonate-chrome" ]; then
